@@ -593,6 +593,7 @@ async def cmd_start(message: Message):
 async def main():
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
     port_str = os.getenv("PORT", "")
+    port = int(port_str) if port_str else 0
 
     allowed = [
         "message",
@@ -601,7 +602,16 @@ async def main():
         "business_connection",
     ]
 
-    if domain and port_str:
+    # Сброс старого webhook (чтобы обновить allowed_updates)
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="OK")
+    app.router.add_get("/", health)
+
+    if domain and port:
         # ─── Railway: webhook ─────────────────────────────
         webhook_path = "/webhook"
         webhook_url = f"https://{domain}{webhook_path}"
@@ -611,14 +621,8 @@ async def main():
             webhook_url,
             secret_token=secret,
             allowed_updates=allowed,
+            drop_pending_updates=True,
         )
-        print(f"Webhook: {webhook_url}")
-
-        app = web.Application()
-
-        async def health(request):
-            return web.Response(text="OK")
-        app.router.add_get("/", health)
 
         handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret)
         handler.register(app, path=webhook_path)
@@ -626,15 +630,33 @@ async def main():
 
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", int(port_str))
+        site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
-        print(f"Listening on :{port_str}")
+
+        mode = f"webhook → {webhook_url}"
+        print(f"Бот запущен ({mode}), порт {port}")
+        try:
+            await bot.send_message(MY_USER_ID, f"🟢 <b>Бот запущен</b>\n├ Режим: webhook\n└ URL: <code>{webhook_url}</code>", parse_mode="HTML")
+        except Exception:
+            pass
 
         await asyncio.Event().wait()
     else:
-        # ─── Локально: polling ────────────────────────────
-        await bot.delete_webhook()
-        print("Бот запущен (polling)")
+        # ─── Polling (+ HTTP на PORT если есть) ───────────
+        if port:
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            print(f"Health-check на порту {port}")
+
+        mode = "polling"
+        print(f"Бот запущен ({mode})")
+        try:
+            await bot.send_message(MY_USER_ID, f"🟢 <b>Бот запущен</b>\n└ Режим: polling", parse_mode="HTML")
+        except Exception:
+            pass
+
         await dp.start_polling(bot, allowed_updates=allowed)
 
 
