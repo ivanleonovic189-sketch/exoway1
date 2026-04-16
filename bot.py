@@ -13,7 +13,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection
 )
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
 # ─── Загрузка .env ───────────────────────────────────────────
@@ -42,6 +42,9 @@ connections: dict[str, dict] = {}
 active_modes: dict[str, str] = {}   # conn_id -> "kawaii" | "bydlo" | "crazy"
 custom_emoji_love: list[str] = []   # LoveDayEmoji
 custom_emoji_mad: list[str] = []    # MadEmoji
+user_numbers: dict[int, int] = {}   # user_id -> #N
+user_counter: int = 0
+msg_counter: int = 0
 
 MONITORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitors.json")
 monitors: dict[str, dict] = {}
@@ -66,6 +69,20 @@ load_monitors()
 
 def fmt(dt: datetime) -> str:
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def get_user_num(uid: int) -> int:
+    global user_counter
+    if uid not in user_numbers:
+        user_counter += 1
+        user_numbers[uid] = user_counter
+    return user_numbers[uid]
+
+
+def next_msg_num() -> int:
+    global msg_counter
+    msg_counter += 1
+    return msg_counter
 
 
 # ─── Kawaii (пикми-режим) ────────────────────────────────────────
@@ -200,12 +217,14 @@ MODE_TRANSFORM = {
 
 @dp.business_connection()
 async def on_business_connection(conn: BusinessConnection):
+    unum = get_user_num(conn.user.id)
     connections[conn.id] = {
         "user_id": conn.user.id,
         "user_name": conn.user.full_name,
         "username": (conn.user.username or "").lower(),
+        "num": unum,
     }
-    logging.info(f"Business connection {conn.id} -> user {conn.user.id} (@{conn.user.username})")
+    logging.info(f"Business connection {conn.id} -> user #{unum} {conn.user.id} (@{conn.user.username})")
 
 
 async def get_owner(conn_id: str) -> dict | None:
@@ -213,12 +232,14 @@ async def get_owner(conn_id: str) -> dict | None:
         return connections[conn_id]
     try:
         conn = await bot.get_business_connection(conn_id)
+        unum = get_user_num(conn.user.id)
         connections[conn_id] = {
             "user_id": conn.user.id,
             "user_name": conn.user.full_name,
             "username": (conn.user.username or "").lower(),
+            "num": unum,
         }
-        logging.info(f"Recovered connection {conn_id} -> user {conn.user.id}")
+        logging.info(f"Recovered connection {conn_id} -> user #{unum} {conn.user.id}")
         return connections[conn_id]
     except Exception as e:
         logging.warning(f"Failed to get connection {conn_id}: {e}")
@@ -482,6 +503,7 @@ async def on_business_message(message: Message):
             fwd_info = f"🔄 Переслано из канала: {ch.title if ch else 'канал'}"
 
     cache[key] = {
+        "msg_num": next_msg_num(),
         "sender_name": sender_name,
         "sender_username": sender_username,
         "sender_id": sender_id,
@@ -532,21 +554,24 @@ async def on_business_message(message: Message):
     has_spoiler = getattr(message, 'has_media_spoiler', False)
     if has_spoiler and owner_id:
         sender = sender_name + (f" ({sender_username})" if sender_username else "")
+        unum_tag = f" [юзер #{get_user_num(message.from_user.id)}]" if owner_id == MY_USER_ID and message.from_user else ""
+        num_tag = f" [#{cache[key]['msg_num']}]" if owner_id == MY_USER_ID else ""
         spoiler_header = (
-            f"🔥 <b>Скрытое медиа (спойлер)</b>\n"
-            f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-            f"├ От: <b>{sender}</b>\n"
-            f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
+            f"🔥 <b>Скрытое медиа (спойлер)</b>{num_tag}"
+            f"\n├ Чат с: <b>{chat_name}{chat_uname}</b>"
+            f"\n├ От: <b>{sender}</b>{unum_tag}"
+            f"\n└ Время: <b>{fmt(datetime.now(MSK))}</b>"
         )
         await send_live_media(owner_id, message, spoiler_header)
         cache[key]["media_forwarded"] = True
 
     if owner_id == MY_USER_ID and (message.photo or message.video) and not has_spoiler:
         sender = sender_name + (f" ({sender_username})" if sender_username else "")
+        unum = get_user_num(message.from_user.id) if message.from_user else 0
         header = (
-            f"📷 <b>Фото/видео из ЛС</b>\n"
-            f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-            f"├ От: <b>{sender}</b>\n"
+            f"📷 <b>Фото/видео из ЛС</b> [#{cache[key]['msg_num']}]"
+            f"\n├ Чат с: <b>{chat_name}{chat_uname}</b>"
+            f"\n├ От: <b>{sender}</b> [юзер #{unum}]"
             f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
         )
         await send_live_media(MY_USER_ID, message, header)
@@ -561,12 +586,13 @@ async def on_business_message(message: Message):
 
         sender = sender_name + (f" ({sender_username})" if sender_username else "")
         owner_display = owner["user_name"] + (f" (@{owner_username})" if owner_username else "")
+        unum = get_user_num(message.from_user.id) if message.from_user else 0
         fwd_line = f"\n├ <b>{fwd_info}</b>" if fwd_info else ""
         reply_line = f"\n├ ↩️ Ответ на: <i>{cache[key].get('reply_text', '')}</i>" if cache[key].get('reply_text') else ""
         header_m = (
-            f"📨 <b>Мониторинг</b>: {owner_display}\n"
+            f"📨 <b>Мониторинг</b>: {owner_display} [#{cache[key]['msg_num']}]\n"
             f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-            f"├ От: <b>{sender}</b>"
+            f"├ От: <b>{sender}</b> [юзер #{unum}]"
             f"{fwd_line}"
             f"{reply_line}\n"
             f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
@@ -597,6 +623,7 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
                 )
             continue
 
+        msg_num = data.get("msg_num", "?")
         sender = data["sender_name"]
         if data["sender_username"]:
             sender += f" ({data['sender_username']})"
@@ -606,10 +633,12 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
 
         fwd_line = f"\n├ <b>{data['fwd_info']}</b>" if data.get("fwd_info") else ""
         reply_line = f"\n├ ↩️ Ответ на: <i>{data['reply_text']}</i>" if data.get("reply_text") else ""
+        unum_tag = f" [юзер #{get_user_num(data['sender_id'])}]" if data.get("sender_id") and owner_id == MY_USER_ID else ""
+        num_tag = f" [#{msg_num}]" if owner_id == MY_USER_ID else ""
 
         header = (
-            f"🗑 <b>Удалено сообщение</b>\n"
-            f"├ От: <b>{sender}</b>"
+            f"🗑 <b>Удалено сообщение</b>{num_tag}\n"
+            f"├ От: <b>{sender}</b>{unum_tag}"
             f"{fwd_line}"
             f"{reply_line}\n"
             f"├ Отправлено: <b>{fmt(data['sent_at'])}</b>\n"
@@ -628,6 +657,96 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
                 )
             else:
                 await send_media(owner_id, data, header)
+
+
+@dp.edited_business_message()
+async def on_edited_business_message(message: Message):
+    if not message.business_connection_id:
+        return
+    conn_id = message.business_connection_id
+    key = (conn_id, message.message_id)
+    old_data = cache.get(key)
+    owner = await get_owner(conn_id)
+    owner_id = owner["user_id"] if owner else None
+
+    new_text = message.text or message.caption or ""
+
+    if message.from_user:
+        sender_name = message.from_user.full_name
+        sender_username = f"@{message.from_user.username}" if message.from_user.username else ""
+        sender_id = message.from_user.id
+    else:
+        sender_name = "Неизвестно"
+        sender_username = ""
+        sender_id = None
+
+    sender = sender_name + (f" ({sender_username})" if sender_username else "")
+    unum = get_user_num(sender_id) if sender_id else 0
+    owner_username = owner["username"] if owner else ""
+    is_monitored = owner_username and owner_username in monitors and owner_id != MY_USER_ID
+
+    if old_data:
+        msg_num = old_data.get("msg_num", "?")
+        old_text = old_data.get("text", "")
+        old_data["text"] = new_text
+
+        if old_text != new_text:
+            # Чужое сообщение — всегда шлём админу
+            if sender_id != owner_id:
+                chat_name = old_data.get("chat_name", "")
+                chat_uname = old_data.get("chat_uname", "")
+                await bot.send_message(
+                    MY_USER_ID,
+                    f"✏️ <b>Сообщение изменено</b> [#{msg_num}]\n"
+                    f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
+                    f"├ От: <b>{sender}</b> [юзер #{unum}]\n"
+                    f"├ Было: <i>{old_text[:200] or '(пусто)'}</i>\n"
+                    f"├ Стало: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                    f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
+                    parse_mode="HTML"
+                )
+            # Владелец сам редактирует — шлём если он в мониторинге
+            elif is_monitored:
+                chat_name = old_data.get("chat_name", "")
+                chat_uname = old_data.get("chat_uname", "")
+                owner_display = owner["user_name"] + (f" (@{owner_username})" if owner_username else "")
+                await bot.send_message(
+                    MY_USER_ID,
+                    f"✏️ <b>Мониторинг — сообщение изменено</b> [#{msg_num}]\n"
+                    f"├ Аккаунт: <b>{owner_display}</b>\n"
+                    f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
+                    f"├ Было: <i>{old_text[:200] or '(пусто)'}</i>\n"
+                    f"├ Стало: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                    f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
+                    parse_mode="HTML"
+                )
+    else:
+        # Не было в кеше — всё равно уведомим
+        if sender_id != owner_id:
+            chat_name = message.chat.first_name or ""
+            chat_uname = f" (@{message.chat.username})" if message.chat.username else ""
+            await bot.send_message(
+                MY_USER_ID,
+                f"✏️ <b>Сообщение изменено</b>\n"
+                f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
+                f"├ От: <b>{sender}</b> [юзер #{unum}]\n"
+                f"├ Новый текст: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
+                parse_mode="HTML"
+            )
+        elif is_monitored:
+            chat_name = message.chat.first_name or ""
+            chat_uname = f" (@{message.chat.username})" if message.chat.username else ""
+            owner_display = owner["user_name"] + (f" (@{owner_username})" if owner_username else "")
+            await bot.send_message(
+                MY_USER_ID,
+                f"✏️ <b>Мониторинг — сообщение изменено</b>\n"
+                f"├ Аккаунт: <b>{owner_display}</b>\n"
+                f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
+                f"├ Новый текст: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
+                parse_mode="HTML"
+            )
 
 
 @dp.message(Command("check"))
@@ -691,7 +810,8 @@ async def cmd_users(message: Message):
     lines = ["👥 <b>Подключённые:</b>\n"]
     for conn_id, info in connections.items():
         uname = f"@{info['username']}" if info['username'] else "без username"
-        lines.append(f"• {info['user_name']} ({uname}) — ID: <code>{info['user_id']}</code>")
+        unum = info.get('num', '?')
+        lines.append(f"• <b>#{unum}</b> {info['user_name']} ({uname}) — ID: <code>{info['user_id']}</code>")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -875,6 +995,7 @@ async def main():
     allowed = [
         "message",
         "business_message",
+        "edited_business_message",
         "deleted_business_messages",
         "business_connection",
     ]
