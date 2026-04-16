@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection
 )
 from aiogram.filters import Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ─── Загрузка .env ───────────────────────────────────────────
 env_path = Path(__file__).parent / ".env"
@@ -589,30 +591,51 @@ async def cmd_start(message: Message):
 
 
 async def main():
-    # ─── HTTP-сервер для Railway health check ─────────────
-    async def health(request):
-        return web.Response(text="OK")
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    port_str = os.getenv("PORT", "")
 
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Health check on port {port}")
+    allowed = [
+        "message",
+        "business_message",
+        "deleted_business_messages",
+        "business_connection",
+    ]
 
-    # ─── Запуск бота ─────────────────────────────────────
-    print("Бот запущен (Business API)")
-    await dp.start_polling(
-        bot,
-        allowed_updates=[
-            "message",
-            "business_message",
-            "deleted_business_messages",
-            "business_connection",
-        ]
-    )
+    if domain and port_str:
+        # ─── Railway: webhook ─────────────────────────────
+        webhook_path = "/webhook"
+        webhook_url = f"https://{domain}{webhook_path}"
+        secret = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
+
+        await bot.set_webhook(
+            webhook_url,
+            secret_token=secret,
+            allowed_updates=allowed,
+        )
+        print(f"Webhook: {webhook_url}")
+
+        app = web.Application()
+
+        async def health(request):
+            return web.Response(text="OK")
+        app.router.add_get("/", health)
+
+        handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret)
+        handler.register(app, path=webhook_path)
+        setup_application(app, dp, bot=bot)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", int(port_str))
+        await site.start()
+        print(f"Listening on :{port_str}")
+
+        await asyncio.Event().wait()
+    else:
+        # ─── Локально: polling ────────────────────────────
+        await bot.delete_webhook()
+        print("Бот запущен (polling)")
+        await dp.start_polling(bot, allowed_updates=allowed)
 
 
 if __name__ == "__main__":
