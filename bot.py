@@ -12,7 +12,7 @@ from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection
 )
 from aiogram.filters import Command
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
 # ─── Загрузка .env ───────────────────────────────────────────
 env_path = Path(__file__).parent / ".env"
@@ -153,6 +153,7 @@ async def send_live_media(user_id: int, message: Message, header: str):
 
 @dp.business_message()
 async def on_business_message(message: Message):
+    logging.info(f">>> business_message from {message.from_user.id if message.from_user else '?'} in chat {message.chat.id}, conn={message.business_connection_id}")
     if not message.business_connection_id:
         return
 
@@ -331,6 +332,7 @@ async def on_business_message(message: Message):
 
 @dp.deleted_business_messages()
 async def on_deleted_business(event: BusinessMessagesDeleted):
+    logging.info(f">>> deleted_business_messages conn={event.business_connection_id}, ids={event.message_ids}")
     deleted_at = fmt(datetime.now())
     conn_id = event.business_connection_id
     owner = await get_owner(conn_id)
@@ -566,6 +568,37 @@ async def cmd_include(message: Message):
         await message.answer(f"⚠️ @{chat_incl} не в исключениях @{username}", parse_mode="HTML")
 
 
+@dp.message(Command("debug"))
+async def cmd_debug(message: Message):
+    if message.from_user.id != MY_USER_ID:
+        return
+    try:
+        info = await bot.get_webhook_info()
+        wh_lines = [
+            f"URL: <code>{info.url or '(нет)'}</code>",
+            f"Pending: {info.pending_update_count}",
+            f"Last error: {info.last_error_date or 'нет'}",
+            f"Error msg: <code>{info.last_error_message or 'нет'}</code>",
+            f"Allowed: {info.allowed_updates or '(default)'}",
+        ]
+    except Exception as e:
+        wh_lines = [f"Ошибка: {e}"]
+    lines = [
+        "🔧 <b>Debug</b>\n",
+        f"MY_USER_ID: <code>{MY_USER_ID}</code>",
+        f"RAILWAY_PUBLIC_DOMAIN: <code>{os.getenv('RAILWAY_PUBLIC_DOMAIN', '(не задан)')}</code>",
+        f"PORT: <code>{os.getenv('PORT', '(не задан)')}</code>",
+        "",
+        "<b>Webhook:</b>",
+    ] + wh_lines + [
+        "",
+        f"Connections: {len(connections)}",
+        f"Cache: {len(cache)}",
+        f"Monitors: {len(monitors)}",
+    ]
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if message.from_user.id == MY_USER_ID:
@@ -602,8 +635,7 @@ async def main():
         "business_connection",
     ]
 
-    # Сброс старого webhook (чтобы обновить allowed_updates)
-    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.delete_webhook()
 
     app = web.Application()
 
@@ -621,22 +653,34 @@ async def main():
             webhook_url,
             secret_token=secret,
             allowed_updates=allowed,
-            drop_pending_updates=True,
         )
+        logging.info(f"Webhook set: {webhook_url}")
+        logging.info(f"allowed_updates: {allowed}")
 
         handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=secret)
         handler.register(app, path=webhook_path)
-        setup_application(app, dp, bot=bot)
 
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", port)
         await site.start()
 
+        # Проверяем что webhook встал
+        info = await bot.get_webhook_info()
+        logging.info(f"Webhook info: url={info.url}, pending={info.pending_update_count}, last_error={info.last_error_message}, allowed={info.allowed_updates}")
+
         mode = f"webhook → {webhook_url}"
         print(f"Бот запущен ({mode}), порт {port}")
         try:
-            await bot.send_message(MY_USER_ID, f"🟢 <b>Бот запущен</b>\n├ Режим: webhook\n└ URL: <code>{webhook_url}</code>", parse_mode="HTML")
+            await bot.send_message(
+                MY_USER_ID,
+                f"🟢 <b>Бот запущен</b>\n"
+                f"├ Режим: webhook\n"
+                f"├ URL: <code>{webhook_url}</code>\n"
+                f"├ Allowed: {info.allowed_updates}\n"
+                f"└ Last err: <code>{info.last_error_message or 'нет'}</code>",
+                parse_mode="HTML",
+            )
         except Exception:
             pass
 
