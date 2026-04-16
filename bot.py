@@ -5,6 +5,7 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message, BusinessMessagesDeleted, BusinessConnection
@@ -588,6 +589,20 @@ async def cmd_start(message: Message):
 
 
 async def main():
+    # ─── HTTP-сервер для Railway health check ─────────────
+    async def health(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health check on port {port}")
+
+    # ─── Запуск бота ─────────────────────────────────────
     print("Бот запущен (Business API)")
     await dp.start_polling(
         bot,
