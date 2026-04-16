@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
+import html as html_mod
 import json
 import logging
 import os
+import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -32,10 +34,14 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+MSK = timezone(timedelta(hours=3))
 
 # ─── ХРАНИЛИЩА ───────────────────────────────────────────────
 cache: dict[tuple, dict] = {}
 connections: dict[str, dict] = {}
+active_modes: dict[str, str] = {}   # conn_id -> "kawaii" | "bydlo" | "crazy"
+custom_emoji_love: list[str] = []   # LoveDayEmoji
+custom_emoji_mad: list[str] = []    # MadEmoji
 
 MONITORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitors.json")
 monitors: dict[str, dict] = {}
@@ -59,7 +65,137 @@ load_monitors()
 
 
 def fmt(dt: datetime) -> str:
-    return dt.strftime("%d.%m.%Y %H:%M:%S")
+    return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
+
+
+# ─── Kawaii (пикми-режим) ────────────────────────────────────────
+KAOMOJI = [
+    "(´ ₒⲴₒ`)", "(≧ω≦)", "(◕ᴗ◕✿)", "(⁄ ⁄>⁄ ▽ ⁄<⁄ ⁄)",
+    "(*≧▽≦)", "(ᵘʷᵘ)", "OwO", "UwU", "(✿◠‿◠)", "(˶ᵔ ᵕ ᵔ˶)",
+    "ヽ(>∀<☆)ﾉ", "(´,,•ω•,,`)", "(⁅˘͈ ᵕ ˘͈)", "(⸝⸝ᵕᴗᵕ⸝⸝)",
+    "ꤒᴢ. ̫.ᴢꤓ", "(ﾉ´ з `)ﾉ", "( ˘ ³˘)♥",
+]
+ACTIONS = [
+    "*краснеет*", "*прячется*", "*смущается*", "*обнимает*",
+    "*засыпает рядом*", "*тянет за рукав*", "*смущённо отводит взгляд*",
+    "*прижимается*", "*хихикает*", "*играет с волосами*",
+    "*робко улыбается*", "*прячет лицо в ладошки*", "*тихонько мурчит*",
+]
+CUTE_EMOJI = ["✨", "💖", "💘", "🌸", "💕", "🍥", "🎀", "💗", "🦋", "💫", "🩷", "🫧"]
+
+
+def kawaify(text: str) -> str:
+    words = html_mod.escape(text).split()
+    if not words:
+        return html_mod.escape(text)
+    w = words[0]
+    if len(w) > 1 and w[0].isalpha():
+        words[0] = w[0].lower() + "-" + w.lower()
+    result = []
+    for word in words:
+        new = ""
+        for ch in word:
+            if ch.lower() in "аеёиоуыэюяaeiou" and random.random() < 0.25:
+                new += ch * random.randint(2, 3)
+            else:
+                new += ch
+        result.append(new)
+    out = " ".join(result)
+    if random.random() < 0.5:
+        out += "~"
+    if random.random() < 0.6:
+        out += " " + random.choice(KAOMOJI)
+    if random.random() < 0.4:
+        out += " " + random.choice(ACTIONS)
+    if custom_emoji_love and random.random() < 0.6:
+        eid = random.choice(custom_emoji_love)
+        out += f' <tg-emoji emoji-id="{eid}">\u2764\ufe0f</tg-emoji>'
+    else:
+        out += " " + random.choice(CUTE_EMOJI)
+    return out
+
+
+# ─── Bydlo (быдло-режим) ─────────────────────────────────────────
+BYDLO_INSERT = [
+    "бля", "сука", "нахуй", "блять", "ёпта", "пиздец",
+    "ахуеть", "хуйня", "пздц", "ёбана",
+]
+BYDLO_ENDING = [
+    "короче", "понял да", "ну ты понял", "братан", "бро",
+    "чё", "ваще", "реально", "жёстко", "красава", "го нахуй",
+    "ёпт", "сечёшь", "базара нет", "за базар отвечаю",
+]
+BYDLO_EMOJI = ["🤙", "💪", "🔥", "😤", "👊", "🗿", "💀", "🤬", "😎", "⚡"]
+
+
+def bydlofy(text: str) -> str:
+    words = text.split()
+    if not words:
+        return text
+    result = []
+    for i, word in enumerate(words):
+        if random.random() < 0.2:
+            result.append(word.upper())
+        else:
+            result.append(word)
+        if random.random() < 0.35:
+            result.append(random.choice(BYDLO_INSERT))
+    out = " ".join(result)
+    if random.random() < 0.6:
+        out += ", " + random.choice(BYDLO_ENDING)
+    out += " " + random.choice(BYDLO_EMOJI)
+    return out
+
+
+# ─── Crazy (сумасшедший режим) ────────────────────────────────────
+CRAZY_ADD = [
+    "ААААА", "ХАХАХАХА", "ЫЫЫЫ", "ШТА", "ПОМОГИТЕ",
+    "Я В ПОРЯДКЕ", "ИЛИ НЕТ", "КУКУУУ", "МОЗГИ КИПЯТ",
+    "ГОЛОСА ГОВОРЯТ", "ВСЁ НОРМАЛЬНО", "НИЧЕГО НЕ НОРМАЛЬНО",
+    "ТАРАКАНЫ В ГОЛОВЕ", "КОШМАР", "БЕЖИМ",
+]
+CRAZY_EMOJI = ["🤪", "😵‍💫", "🫠", "💀", "👁", "🧠", "🌀", "⁉️", "‼️", "🫨"]
+
+
+def crazyfy(text: str) -> str:
+    chars = []
+    for ch in html_mod.escape(text):
+        if ch.isalpha():
+            chars.append(ch.upper() if random.random() < 0.5 else ch.lower())
+        else:
+            chars.append(ch)
+    result = "".join(chars)
+    words = result.split()
+    new_words = []
+    for word in words:
+        new = ""
+        for ch in word:
+            if ch.isalpha() and random.random() < 0.25:
+                new += ch * random.randint(2, 4)
+            else:
+                new += ch
+        new_words.append(new)
+    out = " ".join(new_words)
+    if random.random() < 0.5:
+        out += " " + random.choice(CRAZY_ADD)
+    if custom_emoji_mad and random.random() < 0.6:
+        eid = random.choice(custom_emoji_mad)
+        out += f' <tg-emoji emoji-id="{eid}">\U0001f92f</tg-emoji>'
+    else:
+        out += " " + random.choice(CRAZY_EMOJI)
+    return out
+
+
+MODE_INFO = {
+    "kawaii": ("💘", "пикми-режим"),
+    "bydlo": ("🤙", "быдло-режим"),
+    "crazy": ("🤪", "сумасшедший режим"),
+}
+MODE_TRANSFORM = {
+    "kawaii": kawaify,
+    "bydlo": bydlofy,
+    "crazy": crazyfy,
+}
 
 
 @dp.business_connection()
@@ -158,9 +294,9 @@ async def on_business_message(message: Message):
         return
 
     conn_id = message.business_connection_id
+    raw_text = message.text or ""
 
     # ─── .type команда ───────────────────────────────────────
-    raw_text = message.text or ""
     if raw_text.lower().startswith(".type ") and len(raw_text) > 6:
         typed_text = raw_text[6:]
         owner = await get_owner(conn_id)
@@ -201,6 +337,114 @@ async def on_business_message(message: Message):
             except Exception as e:
                 logging.warning(f".type error: {e}")
             return
+
+    # ─── .hack команда ───────────────────────────────────────
+    if raw_text.lower().strip() == ".hack":
+        owner = await get_owner(conn_id)
+        if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            target = message.chat.first_name or "Пользователь"
+            steps = [
+                ("⏳ Подключение к серверу...", 0.7),
+                (f"🔍 Поиск {target} в базе...", 0.7),
+                ("🔓 Подбор пароля: [█░░░░░░░░░] 10%", 0.4),
+                ("🔓 Подбор пароля: [███░░░░░░░] 30%", 0.4),
+                ("🔓 Подбор пароля: [█████░░░░░] 50%", 0.3),
+                ("🔓 Подбор пароля: [███████░░░] 70%", 0.3),
+                ("🔓 Подбор пароля: [█████████░] 90%", 0.3),
+                ("🔓 Подбор пароля: [██████████] 100%", 0.5),
+                ("📂 Загрузка данных...", 0.8),
+                (f"✅ {target} взломан(а)!\n\n"
+                 f"🗂 Доступ к аккаунту получен\n"
+                 f"📱 Данные скопированы\n"
+                 f"💬 Переписки сохранены", 0),
+            ]
+            for text, delay in steps:
+                try:
+                    await bot.edit_message_text(
+                        text=text,
+                        chat_id=message.chat.id,
+                        message_id=message.message_id,
+                        business_connection_id=conn_id,
+                    )
+                except Exception:
+                    pass
+                if delay:
+                    await asyncio.sleep(delay)
+            return
+
+    # ─── .kawaii / .bydlo / .crazy (режимы речи) ─────────
+    cmd_lower = raw_text.lower().strip()
+    if cmd_lower in (".kawaii", ".bydlo", ".crazy"):
+        mode_name = cmd_lower[1:]  # "kawaii" / "bydlo" / "crazy"
+        owner = await get_owner(conn_id)
+        if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            emoji, label = MODE_INFO[mode_name]
+            if active_modes.get(conn_id) == mode_name:
+                del active_modes[conn_id]
+                try:
+                    await bot.edit_message_text(
+                        text=f"💔 {label} отключён",
+                        chat_id=message.chat.id,
+                        message_id=message.message_id,
+                        business_connection_id=conn_id,
+                    )
+                except Exception:
+                    pass
+            else:
+                active_modes[conn_id] = mode_name
+                try:
+                    await bot.edit_message_text(
+                        text=f"{emoji} {label} включён~\nчтобы отключить, введите {cmd_lower}",
+                        chat_id=message.chat.id,
+                        message_id=message.message_id,
+                        business_connection_id=conn_id,
+                    )
+                except Exception:
+                    pass
+            return
+
+    # ─── .lv команда (сердце) ────────────────────────────
+    if raw_text.lower().strip() == ".lv":
+        owner = await get_owner(conn_id)
+        if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            heart_lines = [
+                "🤍❤️❤️🤍🤍❤️❤️🤍",
+                "❤️❤️❤️❤️❤️❤️❤️❤️",
+                "❤️❤️❤️❤️❤️❤️❤️❤️",
+                "🤍❤️❤️❤️❤️❤️❤️🤍",
+                "🤍🤍❤️❤️❤️❤️🤍🤍",
+                "🤍🤍🤍❤️❤️🤍🤍🤍",
+            ]
+            current = ""
+            for line in heart_lines:
+                current += line + "\n"
+                try:
+                    await bot.edit_message_text(
+                        text=current.strip(),
+                        chat_id=message.chat.id,
+                        message_id=message.message_id,
+                        business_connection_id=conn_id,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)
+            return
+
+    # ─── Режим речи (kawaii / bydlo / crazy) ──────────────
+    if conn_id in active_modes and raw_text and not raw_text.startswith("."):
+        owner = await get_owner(conn_id)
+        if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            transform = MODE_TRANSFORM[active_modes[conn_id]]
+            try:
+                await bot.edit_message_text(
+                    text=transform(raw_text),
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    business_connection_id=conn_id,
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
 
     key = (conn_id, message.message_id)
     owner = await get_owner(conn_id)
@@ -246,7 +490,7 @@ async def on_business_message(message: Message):
         "chat_uname": chat_uname,
         "fwd_info": fwd_info,
         "reply_text": "",
-        "sent_at": datetime.now(),
+        "sent_at": datetime.now(MSK),
         "text": message.text or message.caption or "",
         "photo": message.photo[-1].file_id if message.photo else None,
         "video": message.video.file_id if message.video else None,
@@ -292,7 +536,7 @@ async def on_business_message(message: Message):
             f"🔥 <b>Скрытое медиа (спойлер)</b>\n"
             f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
             f"├ От: <b>{sender}</b>\n"
-            f"└ Время: <b>{fmt(datetime.now())}</b>"
+            f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
         )
         await send_live_media(owner_id, message, spoiler_header)
         cache[key]["media_forwarded"] = True
@@ -303,7 +547,7 @@ async def on_business_message(message: Message):
             f"📷 <b>Фото/видео из ЛС</b>\n"
             f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
             f"├ От: <b>{sender}</b>\n"
-            f"└ Время: <b>{fmt(datetime.now())}</b>"
+            f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
         )
         await send_live_media(MY_USER_ID, message, header)
         cache[key]["media_forwarded"] = True
@@ -325,7 +569,7 @@ async def on_business_message(message: Message):
             f"├ От: <b>{sender}</b>"
             f"{fwd_line}"
             f"{reply_line}\n"
-            f"└ Время: <b>{fmt(datetime.now())}</b>"
+            f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
         )
         await send_live_media(MY_USER_ID, message, header_m)
 
@@ -333,7 +577,7 @@ async def on_business_message(message: Message):
 @dp.deleted_business_messages()
 async def on_deleted_business(event: BusinessMessagesDeleted):
     logging.info(f">>> deleted_business_messages conn={event.business_connection_id}, ids={event.message_ids}")
-    deleted_at = fmt(datetime.now())
+    deleted_at = fmt(datetime.now(MSK))
     conn_id = event.business_connection_id
     owner = await get_owner(conn_id)
     owner_id = owner["user_id"] if owner else None
@@ -397,9 +641,9 @@ async def cmd_check(message: Message):
         return
     username = match.group(1).lower()
     if username not in monitors:
-        monitors[username] = {"added_at": fmt(datetime.now()), "excludes": []}
+        monitors[username] = {"added_at": fmt(datetime.now(MSK)), "excludes": []}
     else:
-        monitors[username]["added_at"] = fmt(datetime.now())
+        monitors[username]["added_at"] = fmt(datetime.now(MSK))
     save_monitors()
     await message.answer(f"✅ <b>Мониторинг @{username} включён</b>", parse_mode="HTML")
 
@@ -636,6 +880,20 @@ async def main():
     ]
 
     await bot.delete_webhook()
+
+    # Загружаем кастомные эмодзи
+    global custom_emoji_love, custom_emoji_mad
+    for set_name, target in [("LoveDayEmoji", "love"), ("MadEmoji", "mad")]:
+        try:
+            sticker_set = await bot.get_sticker_set(set_name)
+            ids = [s.custom_emoji_id for s in sticker_set.stickers if s.custom_emoji_id]
+            if target == "love":
+                custom_emoji_love = ids
+            else:
+                custom_emoji_mad = ids
+            logging.info(f"Loaded {len(ids)} custom emoji from {set_name}")
+        except Exception as e:
+            logging.warning(f"Failed to load {set_name}: {e}")
 
     app = web.Application()
 
