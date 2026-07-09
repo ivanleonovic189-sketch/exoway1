@@ -1044,6 +1044,7 @@ async def cmd_debug(message: Message):
         "🔧 <b>Debug</b>\n",
         f"MY_USER_ID: <code>{MY_USER_ID}</code>",
         f"RAILWAY_PUBLIC_DOMAIN: <code>{os.getenv('RAILWAY_PUBLIC_DOMAIN', '(не задан)')}</code>",
+        f"RENDER_EXTERNAL_HOSTNAME: <code>{os.getenv('RENDER_EXTERNAL_HOSTNAME', '(не задан)')}</code>",
         f"PORT: <code>{os.getenv('PORT', '(не задан)')}</code>",
         "",
         "<b>Webhook:</b>",
@@ -1081,7 +1082,11 @@ async def cmd_start(message: Message):
 
 
 async def main():
-    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+    domain = (
+        os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        or ""
+    )
     port_str = os.getenv("PORT", "")
     port = int(port_str) if port_str else 0
 
