@@ -877,7 +877,20 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
     owner = await get_owner(conn_id)
     owner_id = owner["user_id"] if owner else None
 
-    if owner_id and len(event.message_ids) >= BULK_DELETE_THRESHOLD:
+    if not owner_id:
+        logging.warning(f"deleted_business_messages: не удалось определить владельца conn={conn_id}, ids={event.message_ids}")
+        if MY_USER_ID:
+            await bot.send_message(
+                MY_USER_ID,
+                f"{WARNING} <b>Не удалось обработать удаление</b>\n"
+                f"├ conn_id: <code>{html_mod.escape(conn_id or '')}</code>\n"
+                f"├ Удалено сообщений: <b>{len(event.message_ids)}</b>\n"
+                f"└ Причина: не резолвится владелец подключения (get_business_connection упал или соединение неизвестно)",
+                parse_mode="HTML"
+            )
+        return
+
+    if len(event.message_ids) >= BULK_DELETE_THRESHOLD:
         await send_bulk_deleted_transcript(conn_id, owner_id, event.message_ids, deleted_at)
         return
 
