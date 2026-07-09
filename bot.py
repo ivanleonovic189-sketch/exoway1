@@ -36,6 +36,30 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 MSK = timezone(timedelta(hours=3))
 
+# ─── Премиум-эмодзи ──────────────────────────────────────────
+EMOJI_WARNING_ID = "5420323339723881652"
+EMOJI_EDIT_ID = "5375338737028841420"
+EMOJI_TRASH_ID = "5445267414562389170"
+
+
+def pemoji(emoji_id: str, fallback: str) -> str:
+    """Премиум tg-emoji с обычным эмодзи как фолбэк для не-Premium."""
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+
+WARNING = pemoji(EMOJI_WARNING_ID, "⚠️")
+EDIT_ICON = pemoji(EMOJI_EDIT_ID, "✏️")
+TRASH_ICON = pemoji(EMOJI_TRASH_ID, "🗑")
+
+
+def quote_block(text: str, expandable: bool = True) -> str:
+    """Оборачивает текст в нативную тг-цитату (blockquote)."""
+    if not text:
+        return ""
+    escaped = html_mod.escape(text)
+    attr = " expandable" if expandable else ""
+    return f'\n\n<blockquote{attr}>{escaped}</blockquote>'
+
 # ─── ХРАНИЛИЩА ───────────────────────────────────────────────
 cache: dict[tuple, dict] = {}
 connections: dict[str, dict] = {}
@@ -247,12 +271,13 @@ async def get_owner(conn_id: str) -> dict | None:
 
 
 async def send_media(user_id: int, data: dict, header: str):
+    quote = quote_block(data.get("text", ""))
     try:
         if data.get("photo"):
-            cap = header + (f"\n\n📝 {data['text']}" if data["text"] else "")
+            cap = header + quote
             await bot.send_photo(user_id, data["photo"], caption=cap, parse_mode="HTML")
         elif data.get("video"):
-            cap = header + (f"\n\n📝 {data['text']}" if data["text"] else "")
+            cap = header + quote
             await bot.send_video(user_id, data["video"], caption=cap, parse_mode="HTML")
         elif data.get("voice"):
             await bot.send_message(user_id, header, parse_mode="HTML")
@@ -261,7 +286,7 @@ async def send_media(user_id: int, data: dict, header: str):
             await bot.send_message(user_id, header, parse_mode="HTML")
             await bot.send_sticker(user_id, data["sticker"])
         elif data.get("document"):
-            cap = header + (f"\n\n📝 {data['text']}" if data["text"] else "")
+            cap = header + quote
             await bot.send_document(user_id, data["document"], caption=cap, parse_mode="HTML")
         elif data.get("animation"):
             await bot.send_message(user_id, header, parse_mode="HTML")
@@ -270,10 +295,10 @@ async def send_media(user_id: int, data: dict, header: str):
             await bot.send_message(user_id, header, parse_mode="HTML")
             await bot.send_video_note(user_id, data["video_note"])
         else:
-            body = f"\n\n💬 {data['text']}" if data.get("text") else "\n\n(пустое сообщение)"
+            body = quote if data.get("text") else "\n\n<i>(пустое сообщение)</i>"
             await bot.send_message(user_id, header + body, parse_mode="HTML")
     except Exception as e:
-        await bot.send_message(user_id, f"{header}\n\n⚠️ Ошибка отправки: {e}", parse_mode="HTML")
+        await bot.send_message(user_id, f"{header}\n\n{WARNING} Ошибка отправки: {html_mod.escape(str(e))}", parse_mode="HTML")
 
 
 async def send_live_media(user_id: int, message: Message, header: str):
@@ -305,7 +330,7 @@ async def send_live_media(user_id: int, message: Message, header: str):
             if body:
                 await bot.send_message(user_id, header + body, parse_mode="HTML")
     except Exception as e:
-        await bot.send_message(user_id, f"{header}\n\n⚠️ Ошибка: {e}", parse_mode="HTML")
+        await bot.send_message(user_id, f"{header}\n\n{WARNING} Ошибка: {html_mod.escape(str(e))}", parse_mode="HTML")
 
 
 @dp.business_message()
@@ -425,7 +450,7 @@ async def on_business_message(message: Message):
             return
 
     # ─── .lv команда (сердце) ────────────────────────────
-       if raw_text.lower().strip() == ".lv":
+    if raw_text.lower().strip() == ".lv":
         owner = await get_owner(conn_id)
         if owner and message.from_user and message.from_user.id == owner["user_id"]:
             
@@ -684,9 +709,9 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
             if owner_id:
                 await bot.send_message(
                     owner_id,
-                    f"🗑 <b>Удалено сообщение</b>\n"
+                    f"{TRASH_ICON} <b>Удалено сообщение</b>\n"
                     f"├ Удалено: <b>{deleted_at}</b>\n"
-                    f"└ ⚠️ Содержимое не в кеше (бот не видел это сообщение)",
+                    f"└ {WARNING} Содержимое не в кеше (бот не видел это сообщение)",
                     parse_mode="HTML"
                 )
             continue
@@ -705,7 +730,7 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
         num_tag = f" [#{msg_num}]" if owner_id == MY_USER_ID else ""
 
         header = (
-            f"🗑 <b>Удалено сообщение</b>{num_tag}\n"
+            f"{TRASH_ICON} <b>Удалено сообщение</b>{num_tag}\n"
             f"├ От: <b>{sender}</b>{unum_tag}"
             f"{fwd_line}"
             f"{reply_line}\n"
@@ -717,7 +742,7 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
             if data.get("media_forwarded") and owner_id == MY_USER_ID and (data.get("photo") or data.get("video")):
                 await bot.send_message(
                     MY_USER_ID,
-                    f"🗑 <b>Удалено фото/видео</b>\n"
+                    f"{TRASH_ICON} <b>Удалено фото/видео</b>\n"
                     f"├ От: <b>{sender}</b>\n"
                     f"└ Удалено: <b>{deleted_at}</b>\n\n"
                     f"✅ Уже было переслано при получении",
@@ -765,11 +790,11 @@ async def on_edited_business_message(message: Message):
                 chat_uname = old_data.get("chat_uname", "")
                 await bot.send_message(
                     MY_USER_ID,
-                    f"✏️ <b>Сообщение изменено</b> [#{msg_num}]\n"
+                    f"{EDIT_ICON} <b>Сообщение изменено</b> [#{msg_num}]\n"
                     f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
                     f"├ От: <b>{sender}</b> [юзер #{unum}]\n"
-                    f"├ Было: <i>{old_text[:200] or '(пусто)'}</i>\n"
-                    f"├ Стало: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                    f"├ Было: <i>{html_mod.escape(old_text[:200]) or '(пусто)'}</i>\n"
+                    f"├ Стало: <i>{html_mod.escape(new_text[:200]) or '(пусто)'}</i>\n"
                     f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
                     parse_mode="HTML"
                 )
@@ -780,11 +805,11 @@ async def on_edited_business_message(message: Message):
                 owner_display = owner["user_name"] + (f" (@{owner_username})" if owner_username else "")
                 await bot.send_message(
                     MY_USER_ID,
-                    f"✏️ <b>Мониторинг — сообщение изменено</b> [#{msg_num}]\n"
+                    f"{EDIT_ICON} <b>Мониторинг — сообщение изменено</b> [#{msg_num}]\n"
                     f"├ Аккаунт: <b>{owner_display}</b>\n"
                     f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-                    f"├ Было: <i>{old_text[:200] or '(пусто)'}</i>\n"
-                    f"├ Стало: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                    f"├ Было: <i>{html_mod.escape(old_text[:200]) or '(пусто)'}</i>\n"
+                    f"├ Стало: <i>{html_mod.escape(new_text[:200]) or '(пусто)'}</i>\n"
                     f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
                     parse_mode="HTML"
                 )
@@ -795,10 +820,10 @@ async def on_edited_business_message(message: Message):
             chat_uname = f" (@{message.chat.username})" if message.chat.username else ""
             await bot.send_message(
                 MY_USER_ID,
-                f"✏️ <b>Сообщение изменено</b>\n"
+                f"{EDIT_ICON} <b>Сообщение изменено</b>\n"
                 f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
                 f"├ От: <b>{sender}</b> [юзер #{unum}]\n"
-                f"├ Новый текст: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                f"├ Новый текст: <i>{html_mod.escape(new_text[:200]) or '(пусто)'}</i>\n"
                 f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
                 parse_mode="HTML"
             )
@@ -808,10 +833,10 @@ async def on_edited_business_message(message: Message):
             owner_display = owner["user_name"] + (f" (@{owner_username})" if owner_username else "")
             await bot.send_message(
                 MY_USER_ID,
-                f"✏️ <b>Мониторинг — сообщение изменено</b>\n"
+                f"{EDIT_ICON} <b>Мониторинг — сообщение изменено</b>\n"
                 f"├ Аккаунт: <b>{owner_display}</b>\n"
                 f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-                f"├ Новый текст: <i>{new_text[:200] or '(пусто)'}</i>\n"
+                f"├ Новый текст: <i>{html_mod.escape(new_text[:200]) or '(пусто)'}</i>\n"
                 f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
                 parse_mode="HTML"
             )
@@ -850,7 +875,7 @@ async def cmd_uncheck(message: Message):
         save_monitors()
         await message.answer(f"🛑 Мониторинг @{username} отключён.", parse_mode="HTML")
     else:
-        await message.answer(f"⚠️ @{username} не в списке.", parse_mode="HTML")
+        await message.answer(f"{WARNING} @{username} не в списке.", parse_mode="HTML")
 
 
 @dp.message(Command("monitors"))
@@ -965,7 +990,7 @@ async def cmd_exclude(message: Message):
     username = matches[0].lower()
     chat_excl = matches[1].lower()
     if username not in monitors:
-        await message.answer(f"⚠️ @{username} не в мониторинге.", parse_mode="HTML")
+        await message.answer(f"{WARNING} @{username} не в мониторинге.", parse_mode="HTML")
         return
     excludes = monitors[username].setdefault("excludes", [])
     if chat_excl not in excludes:
@@ -989,7 +1014,7 @@ async def cmd_include(message: Message):
     username = matches[0].lower()
     chat_incl = matches[1].lower()
     if username not in monitors:
-        await message.answer(f"⚠️ @{username} не в мониторинге.", parse_mode="HTML")
+        await message.answer(f"{WARNING} @{username} не в мониторинге.", parse_mode="HTML")
         return
     excludes = monitors[username].get("excludes", [])
     if chat_incl in excludes:
@@ -997,7 +1022,7 @@ async def cmd_include(message: Message):
         save_monitors()
         await message.answer(f"✅ Чат @{chat_incl} снова мониторится для @{username}", parse_mode="HTML")
     else:
-        await message.answer(f"⚠️ @{chat_incl} не в исключениях @{username}", parse_mode="HTML")
+        await message.answer(f"{WARNING} @{chat_incl} не в исключениях @{username}", parse_mode="HTML")
 
 
 @dp.message(Command("debug"))
