@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import html as html_mod
 import json
@@ -11,7 +12,7 @@ from pathlib import Path
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, BusinessMessagesDeleted, BusinessConnection
+    BufferedInputFile, Message, BusinessMessagesDeleted, BusinessConnection
 )
 from aiogram.filters import Command, BaseFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -59,6 +60,181 @@ def quote_block(text: str, expandable: bool = True) -> str:
     escaped = html_mod.escape(text)
     attr = " expandable" if expandable else ""
     return f'\n\n<blockquote{attr}>{escaped}</blockquote>'
+
+
+# ─── Массовое удаление → экспорт переписки в HTML ─────────────
+BULK_DELETE_THRESHOLD = 3   # от скольки удалённых сообщений разом считаем это "снесли всю переписку"
+MAX_EMBED_PHOTOS = 30       # сколько фото максимум вшивать в файл как base64
+
+MEDIA_LABELS = {
+    "photo": "📷 Фото",
+    "video": "🎥 Видео",
+    "voice": "🎤 Голосовое",
+    "sticker": "😀 Стикер",
+    "document": "📄 Документ",
+    "animation": "🎬 GIF",
+    "video_note": "⚫ Кружочек",
+}
+
+
+async def _download_photo_b64(file_id: str) -> str | None:
+    try:
+        file_info = await bot.get_file(file_id)
+        buf = await bot.download_file(file_info.file_path)
+        return base64.b64encode(buf.read()).decode()
+    except Exception as e:
+        logging.warning(f"Не удалось скачать фото {file_id}: {e}")
+        return None
+
+
+async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, photo_budget: list[int]) -> str:
+    if not data:
+        return f'<div class="row system"><span>Сообщение #{msg_id} — нет данных в кеше</span></div>'
+
+    is_owner = owner_id is not None and data.get("sender_id") == owner_id
+    sender = html_mod.escape(data.get("sender_name") or "Неизвестно")
+    if data.get("sender_username"):
+        sender += f" ({html_mod.escape(data['sender_username'])})"
+    time_str = fmt(data["sent_at"])
+    text = html_mod.escape(data.get("text", ""))
+
+    media_html = ""
+    for field, label in MEDIA_LABELS.items():
+        if not data.get(field):
+            continue
+        if field == "photo" and photo_budget[0] > 0:
+            photo_budget[0] -= 1
+            b64 = await _download_photo_b64(data["photo"])
+            if b64:
+                media_html = f'<img class="photo" src="data:image/jpeg;base64,{b64}" alt="photo">'
+            else:
+                media_html = f'<div class="media-tag">{label}</div>'
+        else:
+            media_html = f'<div class="media-tag">{label}</div>'
+        break
+
+    text_html = f'<div class="text">{text}</div>' if text else ""
+    if not text_html and not media_html:
+        text_html = '<div class="text empty">(пусто)</div>'
+
+    side = "out" if is_owner else "in"
+    return (
+        f'<div class="row {side}"><div class="bubble">'
+        f'<div class="meta">{sender} · {time_str}</div>'
+        f'{media_html}{text_html}'
+        f'</div></div>'
+    )
+
+
+async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict | None]], owner_id: int | None) -> str:
+    photo_budget = [MAX_EMBED_PHOTOS]
+    rows = []
+    for msg_id, data in entries:
+        rows.append(await _bubble_html(msg_id, data, owner_id, photo_budget))
+    body = "\n".join(rows)
+    generated = fmt(datetime.now(MSK))
+    title_esc = html_mod.escape(chat_title)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Переписка — {title_esc}</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 24px 12px 48px;
+    background: #0e1621; color: #e9edf1;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }}
+  .header {{
+    max-width: 720px; margin: 0 auto 20px; padding: 16px 20px;
+    background: #17212b; border-radius: 12px;
+  }}
+  .header h1 {{ margin: 0 0 4px; font-size: 18px; }}
+  .header p {{ margin: 0; color: #8a97a3; font-size: 13px; }}
+  .chat {{ max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }}
+  .row {{ display: flex; }}
+  .row.in {{ justify-content: flex-start; }}
+  .row.out {{ justify-content: flex-end; }}
+  .row.system {{ justify-content: center; }}
+  .row.system span {{
+    background: #17212b; color: #8a97a3; font-size: 12px;
+    padding: 6px 12px; border-radius: 8px;
+  }}
+  .bubble {{
+    max-width: 72%; padding: 8px 12px; border-radius: 14px;
+    background: #182533; word-wrap: break-word; white-space: pre-wrap;
+  }}
+  .row.out .bubble {{ background: #2b5278; }}
+  .meta {{ font-size: 12px; color: #8a97a3; margin-bottom: 4px; }}
+  .row.out .meta {{ color: #a9c6e0; }}
+  .text {{ font-size: 15px; line-height: 1.4; }}
+  .text.empty {{ color: #8a97a3; font-style: italic; }}
+  .media-tag {{
+    display: inline-block; font-size: 13px; padding: 4px 8px;
+    background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 4px;
+  }}
+  .photo {{ max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }}
+  @media (prefers-color-scheme: light) {{
+    body {{ background: #f4f4f5; color: #1a1a1a; }}
+    .header, .row.system span {{ background: #ffffff; }}
+    .bubble {{ background: #ffffff; }}
+    .row.out .bubble {{ background: #dcf0ff; }}
+    .row.out .meta {{ color: #4a7ba6; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="header">
+    <h1>💬 {title_esc}</h1>
+    <p>Экспортировано {generated} · сообщений: {len(entries)}</p>
+  </div>
+  <div class="chat">
+    {body}
+  </div>
+</body>
+</html>"""
+
+
+async def send_bulk_deleted_transcript(conn_id: str, owner_id: int, message_ids: list[int], deleted_at: str):
+    entries = []
+    chat_title = ""
+    for msg_id in sorted(message_ids):
+        key = (conn_id, msg_id)
+        data = cache.pop(key, None)
+        if data and not chat_title:
+            chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
+        entries.append((msg_id, data))
+
+    chat_title = chat_title or "Переписка"
+    known = sum(1 for _, d in entries if d)
+    html_doc = await build_transcript_html(chat_title, entries, owner_id)
+
+    safe_title = re.sub(r'[^0-9A-Za-zА-Яа-яЁё_-]+', '_', chat_title)[:40].strip('_') or "chat"
+    filename = f"chat_{safe_title}_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.html"
+
+    caption = (
+        f"{TRASH_ICON} <b>Переписка удалена целиком</b>\n"
+        f"├ Чат с: <b>{html_mod.escape(chat_title)}</b>\n"
+        f"├ Сообщений: <b>{len(entries)}</b> (в кеше: {known})\n"
+        f"└ Удалено: <b>{deleted_at}</b>\n\n"
+        f"📎 Полная переписка сохранена во вложении"
+    )
+    try:
+        await bot.send_document(
+            owner_id,
+            BufferedInputFile(html_doc.encode("utf-8"), filename=filename),
+            caption=caption,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await bot.send_message(
+            owner_id,
+            f"{caption}\n\n{WARNING} Не удалось отправить файл: {html_mod.escape(str(e))}",
+            parse_mode="HTML",
+        )
 
 # ─── ХРАНИЛИЩА ───────────────────────────────────────────────
 cache: dict[tuple, dict] = {}
@@ -701,6 +877,10 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
     owner = await get_owner(conn_id)
     owner_id = owner["user_id"] if owner else None
 
+    if owner_id and len(event.message_ids) >= BULK_DELETE_THRESHOLD:
+        await send_bulk_deleted_transcript(conn_id, owner_id, event.message_ids, deleted_at)
+        return
+
     for msg_id in event.message_ids:
         key = (conn_id, msg_id)
         data = cache.pop(key, None)
@@ -784,15 +964,17 @@ async def on_edited_business_message(message: Message):
         old_data["text"] = new_text
 
         if old_text != new_text:
-            # Чужое сообщение — всегда шлём админу
-            if sender_id != owner_id:
+            # Чужое сообщение — шлём владельцу подключения (тому, кто подключил бота)
+            if sender_id != owner_id and owner_id:
                 chat_name = old_data.get("chat_name", "")
                 chat_uname = old_data.get("chat_uname", "")
+                num_tag = f" [#{msg_num}]" if owner_id == MY_USER_ID else ""
+                unum_tag = f" [юзер #{unum}]" if owner_id == MY_USER_ID else ""
                 await bot.send_message(
-                    MY_USER_ID,
-                    f"{EDIT_ICON} <b>Сообщение изменено</b> [#{msg_num}]\n"
+                    owner_id,
+                    f"{EDIT_ICON} <b>Сообщение изменено</b>{num_tag}\n"
                     f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-                    f"├ От: <b>{sender}</b> [юзер #{unum}]\n"
+                    f"├ От: <b>{sender}</b>{unum_tag}\n"
                     f"├ Было: <i>{html_mod.escape(old_text[:200]) or '(пусто)'}</i>\n"
                     f"├ Стало: <i>{html_mod.escape(new_text[:200]) or '(пусто)'}</i>\n"
                     f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
@@ -814,15 +996,16 @@ async def on_edited_business_message(message: Message):
                     parse_mode="HTML"
                 )
     else:
-        # Не было в кеше — всё равно уведомим
-        if sender_id != owner_id:
+        # Не было в кеше — всё равно уведомим владельца подключения
+        if sender_id != owner_id and owner_id:
             chat_name = message.chat.first_name or ""
             chat_uname = f" (@{message.chat.username})" if message.chat.username else ""
+            unum_tag = f" [юзер #{unum}]" if owner_id == MY_USER_ID else ""
             await bot.send_message(
-                MY_USER_ID,
+                owner_id,
                 f"{EDIT_ICON} <b>Сообщение изменено</b>\n"
                 f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-                f"├ От: <b>{sender}</b> [юзер #{unum}]\n"
+                f"├ От: <b>{sender}</b>{unum_tag}\n"
                 f"├ Новый текст: <i>{html_mod.escape(new_text[:200]) or '(пусто)'}</i>\n"
                 f"└ Время: <b>{fmt(datetime.now(MSK))}</b>",
                 parse_mode="HTML"
