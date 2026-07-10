@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import html as html_mod
 import json
 import logging
 import os
 import random
 import re
+import secrets
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from aiohttp import web
@@ -29,6 +31,7 @@ if env_path.exists():
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")   # если пусто — веб-админка отключена
 # ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -41,6 +44,14 @@ MSK = timezone(timedelta(hours=3))
 EMOJI_WARNING_ID = "5420323339723881652"
 EMOJI_EDIT_ID = "5375338737028841420"
 EMOJI_TRASH_ID = "5445267414562389170"
+EMOJI_EXPORT_PROGRESS_ID = "5282843764451195532"
+EMOJI_EXPORT_DONE_ID = "5253742260054409879"
+EMOJI_INFO_LOVE_ID = "5255861796350224063"
+EMOJI_INFO_BIRTHDAY_ID = "5404431410972864937"
+EMOJI_INFO_AGE_ID = "5395444514028529554"
+EMOJI_INFO_WANT_ID = "5397782960512444700"
+EMOJI_INFO_DISLIKE_ID = "5210952531676504517"
+EMOJI_INFO_LOCATION_ID = "5416041192905265756"
 
 
 def pemoji(emoji_id: str, fallback: str) -> str:
@@ -51,6 +62,14 @@ def pemoji(emoji_id: str, fallback: str) -> str:
 WARNING = pemoji(EMOJI_WARNING_ID, "⚠️")
 EDIT_ICON = pemoji(EMOJI_EDIT_ID, "✏️")
 TRASH_ICON = pemoji(EMOJI_TRASH_ID, "🗑")
+EXPORT_PROGRESS = pemoji(EMOJI_EXPORT_PROGRESS_ID, "⏳")
+EXPORT_DONE = pemoji(EMOJI_EXPORT_DONE_ID, "✅")
+INFO_LOVE = pemoji(EMOJI_INFO_LOVE_ID, "💘")
+INFO_BIRTHDAY = pemoji(EMOJI_INFO_BIRTHDAY_ID, "🎉")
+INFO_AGE = pemoji(EMOJI_INFO_AGE_ID, "🎂")
+INFO_WANT = pemoji(EMOJI_INFO_WANT_ID, "🎯")
+INFO_DISLIKE = pemoji(EMOJI_INFO_DISLIKE_ID, "🚫")
+INFO_LOCATION = pemoji(EMOJI_INFO_LOCATION_ID, "📍")
 
 
 def quote_block(text: str, expandable: bool = True) -> str:
@@ -1275,10 +1294,13 @@ async def cmd_export(message: Message):
         await message.answer(f"📭 Нет сообщений с @{username} в кеше.")
         return
 
-    await message.answer(f"⏳ Готовлю переписку с @{username} ({len(entries)} сообщений)…")
+    await message.answer(
+        f"{EXPORT_PROGRESS} Готовлю переписку с @{username} ({len(entries)} сообщений)…",
+        parse_mode="HTML"
+    )
 
     caption = (
-        f"📤 <b>Экспорт переписки</b>\n"
+        f"{EXPORT_DONE} <b>Экспорт переписки готов</b>\n"
         f"├ Чат с: <b>{html_mod.escape(chat_title)}</b>\n"
         f"├ Сообщений: <b>{len(entries)}</b>\n"
         f"└ Сформировано: <b>{fmt(datetime.now(MSK))}</b>\n\n"
@@ -1289,24 +1311,24 @@ async def cmd_export(message: Message):
 
 # ─── /info — ключевые моменты по ключевым словам ──────────────
 INFO_PATTERNS = [
-    ("🎂 Возраст", [
+    (f"{INFO_AGE} Возраст", [
         r'мне\s+(\d{1,3})\s*(?:лет|года|год)\b',
         r'исполнилось\s+(\d{1,3})\s*(?:лет|года|год)?',
     ]),
-    ("🎉 Дата рождения", [
+    (f"{INFO_BIRTHDAY} Дата рождения", [
         r'(?:день\s*рождения|др)\D{0,15}(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
         r'родил[а]?сь?\D{0,15}(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
     ]),
-    ("💘 Симпатия / любовь", [
+    (f"{INFO_LOVE} Симпатия / любовь", [
         r'(?:люблю|обожаю|нравится|влюблен[а]?|втюрилась|втюрился|втрескал[а]?сь)\s+([^\n.!?,]{1,60})',
     ]),
-    ("🎯 Хочет / мечтает", [
+    (f"{INFO_WANT} Хочет / мечтает", [
         r'(?:хочу|мечтаю|надеюсь|планирую)\s+([^\n.!?,]{1,60})',
     ]),
-    ("🚫 Не любит / бесит", [
+    (f"{INFO_DISLIKE} Не любит / бесит", [
         r'(?:ненавиж[у]|бесит|терпеть не могу|не люблю)\s+([^\n.!?,]{1,60})',
     ]),
-    ("📍 Место / город", [
+    (f"{INFO_LOCATION} Место / город", [
         r'(?:я\s+из|живу\s+в)\s+([^\n.,!?]{1,40})',
     ]),
     ("💼 Работа / учёба", [
@@ -1316,7 +1338,9 @@ INFO_PATTERNS = [
 
 
 def scan_info(entries: list[tuple[int, dict]]) -> dict[str, list[tuple[str, str, str]]]:
+    """Для каждой категории отдаёт (время, отправитель, ПОЛНЫЙ текст сообщения) — без дублей на одно сообщение."""
     found: dict[str, list[tuple[str, str, str]]] = {label: [] for label, _ in INFO_PATTERNS}
+    seen: dict[str, set] = {label: set() for label, _ in INFO_PATTERNS}
     for msg_id, data in entries:
         text = data.get("text", "")
         if not text:
@@ -1324,11 +1348,13 @@ def scan_info(entries: list[tuple[int, dict]]) -> dict[str, list[tuple[str, str,
         time_str = fmt(data["sent_at"])
         sender = data.get("sender_name", "?")
         for label, patterns in INFO_PATTERNS:
+            if msg_id in seen[label]:
+                continue
             for pattern in patterns:
-                for m in re.finditer(pattern, text, re.IGNORECASE):
-                    snippet = (m.group(1) if m.groups() else m.group(0)).strip()
-                    if snippet:
-                        found[label].append((time_str, sender, snippet))
+                if re.search(pattern, text, re.IGNORECASE):
+                    found[label].append((time_str, sender, text))
+                    seen[label].add(msg_id)
+                    break
     return found
 
 
@@ -1357,9 +1383,10 @@ async def cmd_info(message: Message):
         if not items:
             continue
         lines.append(f"\n<b>{label}</b>")
-        for time_str, sender, snippet in items[:8]:
+        for time_str, sender, full_text in items[:6]:
             total += 1
-            lines.append(f"· {time_str} — <b>{html_mod.escape(sender)}</b>: «{html_mod.escape(snippet)}»")
+            shown = full_text[:3000] + ("…" if len(full_text) > 3000 else "")
+            lines.append(f"· {time_str} — <b>{html_mod.escape(sender)}</b>{quote_block(shown)}")
 
     if total == 0:
         await message.answer(f"🤷 По @{username} ничего не нашлось — совпадений по ключевым словам нет.")
@@ -1463,6 +1490,8 @@ async def cmd_debug(message: Message):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if message.from_user.id == MY_USER_ID:
+        domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
+        admin_line = f"\n\n🌐 Веб-админка: https://{domain}/admin" if domain and ADMIN_PASSWORD else ""
         await message.answer(
             "👁 Бот запущен.\n\n"
             "<b>Команды:</b>\n"
@@ -1473,7 +1502,8 @@ async def cmd_start(message: Message):
             "/last @user 10 — последние сообщения\n"
             "/export @user — вся переписка в HTML-файл\n"
             "/monitors — список\n"
-            "/users — подключённые",
+            "/users — подключённые"
+            f"{admin_line}",
             parse_mode="HTML"
         )
     else:
@@ -1486,6 +1516,258 @@ async def cmd_start(message: Message):
             "/info @user — найти в переписке ключевые моменты (возраст, симпатии, желания и т.п.)",
             parse_mode="HTML"
         )
+
+
+# ─── Веб-админка ───────────────────────────────────────────────
+ADMIN_COOKIE_NAME = "exoway_admin"
+ADMIN_SESSION_TOKEN = secrets.token_hex(32)   # генерируется заново при каждом запуске процесса
+
+ADMIN_CSS = """
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding: 24px 16px 48px; background:#0e1621; color:#e9edf1;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  a { color:#6ab0f3; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .top { max-width:900px; margin: 0 auto 16px; display:flex; justify-content:space-between; align-items:center; }
+  .card { max-width: 900px; margin: 0 auto 16px; background:#17212b; border-radius:12px; padding:16px 20px; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  table { width:100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align:left; padding: 6px 10px; border-bottom: 1px solid #223042; }
+  input, button { background:#182533; color:#e9edf1; border:1px solid #223042; border-radius:8px;
+                  padding:8px 10px; font-size:14px; }
+  button { cursor:pointer; background:#2b5278; border:none; }
+  form { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin: 8px 0; }
+  .muted { color:#8a97a3; font-size: 13px; }
+  @media (prefers-color-scheme: light) {
+    body { background:#f4f4f5; color:#1a1a1a; }
+    .card, .top { background: transparent; }
+    .card { background:#ffffff; }
+    th, td { border-bottom: 1px solid #e2e2e2; }
+    input, button { background:#f0f0f0; color:#1a1a1a; border:1px solid #ddd; }
+  }
+"""
+
+
+def _admin_page(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html_mod.escape(title)}</title>
+<style>{ADMIN_CSS}</style></head><body>
+<div class="top"><div><b>👁 Exoway admin</b></div><div><a href="/admin/logout">Выйти</a></div></div>
+{body}
+</body></html>"""
+
+
+def _admin_login_page(error: str = "") -> str:
+    err = f'<p style="color:#e57373">{html_mod.escape(error)}</p>' if error else ""
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход — Exoway admin</title>
+<style>
+  body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#0e1621; color:#e9edf1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+  form {{ background:#17212b; padding:24px 28px; border-radius:12px; width:280px; }}
+  input {{ width:100%; padding:10px; margin:8px 0; border-radius:8px; border:1px solid #223042;
+           background:#182533; color:#e9edf1; box-sizing:border-box; }}
+  button {{ width:100%; padding:10px; border-radius:8px; border:none; background:#2b5278; color:#fff; cursor:pointer; }}
+</style></head><body>
+<form method="post" action="/admin/login">
+  <h2>👁 Вход в админку</h2>
+  {err}
+  <input type="password" name="password" placeholder="Пароль" autofocus>
+  <button type="submit">Войти</button>
+</form>
+</body></html>"""
+
+
+def _is_authed(request: web.Request) -> bool:
+    if not ADMIN_PASSWORD:
+        return False
+    cookie = request.cookies.get(ADMIN_COOKIE_NAME, "")
+    return hmac.compare_digest(cookie, ADMIN_SESSION_TOKEN)
+
+
+async def admin_login_get(request: web.Request):
+    if not ADMIN_PASSWORD:
+        return web.Response(text="Веб-админка отключена (не задан ADMIN_PASSWORD).", status=503)
+    if _is_authed(request):
+        return web.HTTPFound("/admin")
+    return web.Response(text=_admin_login_page(), content_type="text/html")
+
+
+async def admin_login_post(request: web.Request):
+    if not ADMIN_PASSWORD:
+        return web.Response(text="Веб-админка отключена.", status=503)
+    data = await request.post()
+    password = data.get("password", "")
+    if hmac.compare_digest(password, ADMIN_PASSWORD):
+        resp = web.HTTPFound("/admin")
+        resp.set_cookie(
+            ADMIN_COOKIE_NAME, ADMIN_SESSION_TOKEN,
+            httponly=True, samesite="Strict", secure=(request.scheme == "https"),
+            max_age=7 * 24 * 3600,
+        )
+        return resp
+    return web.Response(text=_admin_login_page("Неверный пароль"), content_type="text/html", status=401)
+
+
+async def admin_logout(request: web.Request):
+    resp = web.HTTPFound("/admin/login")
+    resp.del_cookie(ADMIN_COOKIE_NAME)
+    return resp
+
+
+async def admin_dashboard(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+
+    rows = []
+    for conn_id, info in connections.items():
+        uname = f"@{info['username']}" if info['username'] else "—"
+        count = sum(1 for (cid, _mid) in cache if cid == conn_id)
+        rows.append(
+            f"<tr><td>#{info.get('num', '?')}</td><td>{html_mod.escape(info['user_name'])}</td>"
+            f"<td>{html_mod.escape(uname)}</td><td><code>{info['user_id']}</code></td>"
+            f"<td>{count}</td>"
+            f'<td><a href="/admin/connection/{conn_id}">Открыть</a></td></tr>'
+        )
+    conn_table = (
+        "<table><tr><th>#</th><th>Имя</th><th>Username</th><th>ID</th><th>Сообщений</th><th></th></tr>"
+        + "".join(rows) + "</table>"
+    ) if rows else '<p class="muted">Нет подключений.</p>'
+
+    mon_rows = []
+    for acc, info in monitors.items():
+        excl = ", ".join(f"@{e}" for e in info.get("excludes", [])) or "—"
+        mon_rows.append(
+            f"<tr><td>@{html_mod.escape(acc)}</td><td>{info.get('added_at', '?')}</td><td>{excl}</td>"
+            f'<td><form method="post" action="/admin/monitors/remove/{acc}">'
+            f'<button type="submit">Убрать</button></form></td></tr>'
+        )
+    mon_table = (
+        "<table><tr><th>Аккаунт</th><th>С</th><th>Исключения</th><th></th></tr>" + "".join(mon_rows) + "</table>"
+    ) if mon_rows else '<p class="muted">Мониторинг не настроен.</p>'
+
+    body = f"""
+    <div class="card"><h1>📊 Статус</h1>
+      <p class="muted">Подключений: {len(connections)} · Сообщений в кеше: {len(cache)} · Мониторингов: {len(monitors)}</p>
+    </div>
+    <div class="card"><h2>👥 Подключения</h2>{conn_table}</div>
+    <div class="card"><h2>📋 Мониторинг</h2>{mon_table}
+      <form method="post" action="/admin/monitors/add">
+        <input name="username" placeholder="username без @">
+        <button type="submit">Добавить</button>
+      </form>
+    </div>
+    """
+    return web.Response(text=_admin_page("Exoway — admin", body), content_type="text/html")
+
+
+async def admin_connection(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    conn_id = request.match_info["conn_id"]
+    owner = connections.get(conn_id)
+    if not owner:
+        return web.Response(text="Подключение не найдено", status=404)
+
+    chats: dict[str, dict] = {}
+    for (cid, msg_id), data in cache.items():
+        if cid != conn_id:
+            continue
+        chat_uname_raw = (data.get("chat_uname") or "").strip(" ()@").lower()
+        key = chat_uname_raw or f"noname_{data.get('chat_name', '')}"
+        entry = chats.setdefault(key, {
+            "title": (data.get("chat_name") or "") + (data.get("chat_uname") or ""),
+            "count": 0,
+            "uname": chat_uname_raw,
+        })
+        entry["count"] += 1
+
+    rows = []
+    for key, info in sorted(chats.items(), key=lambda x: -x[1]["count"]):
+        if info["uname"]:
+            link = f'<a href="/admin/connection/{conn_id}/export?chat={info["uname"]}">Скачать HTML</a>'
+        else:
+            link = '<span class="muted">нет username, не экспортировать</span>'
+        rows.append(f"<tr><td>{html_mod.escape(info['title'])}</td><td>{info['count']}</td><td>{link}</td></tr>")
+
+    table = (
+        "<table><tr><th>Собеседник</th><th>Сообщений</th><th></th></tr>" + "".join(rows) + "</table>"
+    ) if rows else '<p class="muted">В кеше пока ничего нет для этого подключения.</p>'
+
+    body = f"""
+    <p><a href="/admin">← Назад</a></p>
+    <div class="card">
+      <h1>{html_mod.escape(owner['user_name'])} {f"(@{html_mod.escape(owner['username'])})" if owner['username'] else ""}</h1>
+      <p class="muted">ID: <code>{owner['user_id']}</code> · #{owner.get('num', '?')}</p>
+      {table}
+    </div>
+    """
+    return web.Response(text=_admin_page(f"{owner['user_name']} — Exoway admin", body), content_type="text/html")
+
+
+async def admin_export(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    conn_id = request.match_info["conn_id"]
+    owner = connections.get(conn_id)
+    if not owner:
+        return web.Response(text="Подключение не найдено", status=404)
+    username = request.query.get("chat", "").strip(" @").lower()
+    if not username:
+        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
+
+    entries = []
+    chat_title = ""
+    for (cid, msg_id), data in cache.items():
+        if cid != conn_id:
+            continue
+        chat_uname_raw = (data.get("chat_uname") or "").strip(" ()@").lower()
+        if chat_uname_raw != username:
+            continue
+        entries.append((msg_id, data))
+        if not chat_title:
+            chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
+    entries.sort(key=lambda item: item[1]["sent_at"])
+
+    if not entries:
+        return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
+
+    html_doc = await build_transcript_html(chat_title or f"@{username}", entries, owner["user_id"])
+    return web.Response(
+        text=html_doc,
+        content_type="text/html",
+        headers={"Content-Disposition": f'inline; filename="chat_{username}.html"'},
+    )
+
+
+async def admin_monitor_add(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    data = await request.post()
+    username = data.get("username", "").strip(" @").lower()
+    if username:
+        if username not in monitors:
+            monitors[username] = {"added_at": fmt(datetime.now(MSK)), "excludes": []}
+        else:
+            monitors[username]["added_at"] = fmt(datetime.now(MSK))
+        save_monitors()
+    return web.HTTPFound("/admin")
+
+
+async def admin_monitor_remove(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    username = request.match_info["username"]
+    if username in monitors:
+        del monitors[username]
+        save_monitors()
+    return web.HTTPFound("/admin")
 
 
 async def main():
@@ -1526,6 +1808,14 @@ async def main():
     async def health(request):
         return web.Response(text="OK")
     app.router.add_get("/", health)
+    app.router.add_get("/admin", admin_dashboard)
+    app.router.add_get("/admin/login", admin_login_get)
+    app.router.add_post("/admin/login", admin_login_post)
+    app.router.add_get("/admin/logout", admin_logout)
+    app.router.add_get("/admin/connection/{conn_id}", admin_connection)
+    app.router.add_get("/admin/connection/{conn_id}/export", admin_export)
+    app.router.add_post("/admin/monitors/add", admin_monitor_add)
+    app.router.add_post("/admin/monitors/remove/{username}", admin_monitor_remove)
 
     if domain and port:
         # ─── Railway: webhook ─────────────────────────────
