@@ -1122,16 +1122,26 @@ async def on_business_message(message: Message):
         await send_live_media(owner_id, message, spoiler_header)
         cache[key]["media_forwarded"] = True
 
-    if owner_id == MY_USER_ID and (message.photo or message.video) and not has_spoiler:
+    # Пересылаем ВСЕ входящие сообщения от не-владельца владельцу подключения
+    if owner_id and (sender_id is None or sender_id != owner_id) and not has_spoiler and not cache[key].get("media_forwarded"):
         sender = sender_name + (f" ({sender_username})" if sender_username else "")
-        unum = get_user_num(message.from_user.id) if message.from_user else 0
+        unum = get_user_num(sender_id) if sender_id else 0
+        unum_tag = f" [юзер #{unum}]" if owner_id == MY_USER_ID else ""
+        num_tag = f" [#{cache[key]['msg_num']}]" if owner_id == MY_USER_ID else ""
+        fwd_line = f"\n├ <b>{html_mod.escape(fwd_info)}</b>" if fwd_info else ""
+        reply_line = (
+            f"\n├ ↩️ Ответ на: <i>{html_mod.escape(cache[key].get('reply_text', ''))}</i>"
+            if cache[key].get('reply_text') else ""
+        )
         header = (
-            f"📷 <b>Фото/видео из ЛС</b> [#{cache[key]['msg_num']}]"
-            f"\n├ Чат с: <b>{chat_name}{chat_uname}</b>"
-            f"\n├ От: <b>{sender}</b> [юзер #{unum}]"
+            f"📨 <b>Новое сообщение</b>{num_tag}\n"
+            f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
+            f"├ От: <b>{sender}</b>{unum_tag}"
+            f"{fwd_line}"
+            f"{reply_line}\n"
             f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
         )
-        await send_live_media(MY_USER_ID, message, header)
+        await send_live_media(owner_id, message, header)
         cache[key]["media_forwarded"] = True
 
     if owner_username and owner_username in monitors and owner_id != MY_USER_ID:
@@ -1220,9 +1230,9 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
         )
 
         if owner_id:
-            if data.get("media_forwarded") and owner_id == MY_USER_ID and (data.get("photo") or data.get("video")):
+            if data.get("media_forwarded") and (data.get("photo") or data.get("video")):
                 await bot.send_message(
-                    MY_USER_ID,
+                    owner_id,
                     f"{TRASH_ICON} <b>Удалено фото/видео</b>\n"
                     f"├ От: <b>{sender}</b>\n"
                     f"└ Удалено: <b>{deleted_at}</b>\n\n"
