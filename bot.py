@@ -1,14 +1,12 @@
 import asyncio
 import base64
 import hashlib
-import hmac
 import html as html_mod
 import json
 import logging
 import os
 import random
 import re
-import secrets
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -34,7 +32,6 @@ if env_path.exists():
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")   # если пусто — веб-админка отключена
 # ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -1122,28 +1119,6 @@ async def on_business_message(message: Message):
         await send_live_media(owner_id, message, spoiler_header)
         cache[key]["media_forwarded"] = True
 
-    # Пересылаем ВСЕ входящие сообщения от не-владельца → только MY_USER_ID
-    if owner_id == MY_USER_ID and (sender_id is None or sender_id != owner_id) and not has_spoiler and not cache[key].get("media_forwarded"):
-        sender = sender_name + (f" ({sender_username})" if sender_username else "")
-        unum = get_user_num(sender_id) if sender_id else 0
-        unum_tag = f" [юзер #{unum}]" if owner_id == MY_USER_ID else ""
-        num_tag = f" [#{cache[key]['msg_num']}]" if owner_id == MY_USER_ID else ""
-        fwd_line = f"\n├ <b>{html_mod.escape(fwd_info)}</b>" if fwd_info else ""
-        reply_line = (
-            f"\n├ ↩️ Ответ на: <i>{html_mod.escape(cache[key].get('reply_text', ''))}</i>"
-            if cache[key].get('reply_text') else ""
-        )
-        header = (
-            f"📨 <b>Новое сообщение</b>{num_tag}\n"
-            f"├ Чат с: <b>{chat_name}{chat_uname}</b>\n"
-            f"├ От: <b>{sender}</b>{unum_tag}"
-            f"{fwd_line}"
-            f"{reply_line}\n"
-            f"└ Время: <b>{fmt(datetime.now(MSK))}</b>"
-        )
-        await send_live_media(owner_id, message, header)
-        cache[key]["media_forwarded"] = True
-
     if owner_username and owner_username in monitors and owner_id != MY_USER_ID:
         # Проверка исключений чатов
         excludes = monitors[owner_username].get("excludes", [])
@@ -2105,7 +2080,6 @@ async def on_pending_input(message: Message):
 async def cmd_start(message: Message):
     if message.from_user.id == MY_USER_ID:
         domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
-        admin_line = f"\n\n🌐 Веб-админка: https://{domain}/admin" if domain and ADMIN_PASSWORD else ""
         await message.answer(
             "👁 Бот запущен.\n\n"
             "Нажми «☰ Меню» снизу — команды набирать не обязательно.\n\n"
@@ -2119,8 +2093,7 @@ async def cmd_start(message: Message):
             "/remind — напоминание (МСК)\n"
             "/reminders — список напоминаний\n"
             "/monitors — список\n"
-            "/users — подключённые"
-            f"{admin_line}",
+            "/users — подключённые",
             parse_mode="HTML",
             reply_markup=main_reply_keyboard(),
         )
@@ -2136,457 +2109,6 @@ async def cmd_start(message: Message):
         )
 
 
-# ─── Веб-админка ───────────────────────────────────────────────
-ADMIN_COOKIE_NAME = "exoway_admin"
-ADMIN_SESSION_TOKEN = secrets.token_hex(32)   # генерируется заново при каждом запуске процесса
-
-ADMIN_CSS = """
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin:0; padding: 24px 16px 48px; background:#0e1621; color:#e9edf1;
-         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  a { color:#6ab0f3; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .top { max-width:900px; margin: 0 auto 16px; display:flex; justify-content:space-between; align-items:center; }
-  .card { max-width: 900px; margin: 0 auto 16px; background:#17212b; border-radius:12px; padding:16px 20px; }
-  h1 { font-size: 20px; margin: 0 0 8px; }
-  h2 { font-size: 16px; margin: 0 0 12px; }
-  table { width:100%; border-collapse: collapse; font-size: 14px; }
-  th, td { text-align:left; padding: 6px 10px; border-bottom: 1px solid #223042; }
-  input, button { background:#182533; color:#e9edf1; border:1px solid #223042; border-radius:8px;
-                  padding:8px 10px; font-size:14px; }
-  button { cursor:pointer; background:#2b5278; border:none; }
-  form { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin: 8px 0; }
-  .muted { color:#8a97a3; font-size: 13px; }
-  @media (prefers-color-scheme: light) {
-    body { background:#f4f4f5; color:#1a1a1a; }
-    .card, .top { background: transparent; }
-    .card { background:#ffffff; }
-    th, td { border-bottom: 1px solid #e2e2e2; }
-    input, button { background:#f0f0f0; color:#1a1a1a; border:1px solid #ddd; }
-  }
-"""
-
-
-def _admin_page(title: str, body: str) -> str:
-    return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html_mod.escape(title)}</title>
-<style>{ADMIN_CSS}</style></head><body>
-<div class="top"><div><b>👁 Exoway admin</b></div><div><a href="/admin/logout">Выйти</a></div></div>
-{body}
-</body></html>"""
-
-
-def _admin_login_page(error: str = "") -> str:
-    err = f'<p style="color:#e57373">{html_mod.escape(error)}</p>' if error else ""
-    return f"""<!doctype html>
-<html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Вход — Exoway admin</title>
-<style>
-  body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-         background:#0e1621; color:#e9edf1; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-  form {{ background:#17212b; padding:24px 28px; border-radius:12px; width:280px; }}
-  input {{ width:100%; padding:10px; margin:8px 0; border-radius:8px; border:1px solid #223042;
-           background:#182533; color:#e9edf1; box-sizing:border-box; }}
-  button {{ width:100%; padding:10px; border-radius:8px; border:none; background:#2b5278; color:#fff; cursor:pointer; }}
-</style></head><body>
-<form method="post" action="/admin/login">
-  <h2>👁 Вход в админку</h2>
-  {err}
-  <input type="password" name="password" placeholder="Пароль" autofocus>
-  <button type="submit">Войти</button>
-</form>
-</body></html>"""
-
-
-def _is_authed(request: web.Request) -> bool:
-    if not ADMIN_PASSWORD:
-        return False
-    cookie = request.cookies.get(ADMIN_COOKIE_NAME, "")
-    return hmac.compare_digest(cookie, ADMIN_SESSION_TOKEN)
-
-
-async def admin_login_get(request: web.Request):
-    if not ADMIN_PASSWORD:
-        return web.Response(text="Веб-админка отключена (не задан ADMIN_PASSWORD).", status=503)
-    if _is_authed(request):
-        return web.HTTPFound("/admin")
-    return web.Response(text=_admin_login_page(), content_type="text/html")
-
-
-async def admin_login_post(request: web.Request):
-    if not ADMIN_PASSWORD:
-        return web.Response(text="Веб-админка отключена.", status=503)
-    data = await request.post()
-    password = data.get("password", "")
-    if hmac.compare_digest(password, ADMIN_PASSWORD):
-        resp = web.HTTPFound("/admin")
-        resp.set_cookie(
-            ADMIN_COOKIE_NAME, ADMIN_SESSION_TOKEN,
-            httponly=True, samesite="Strict", secure=(request.scheme == "https"),
-            max_age=7 * 24 * 3600,
-        )
-        return resp
-    return web.Response(text=_admin_login_page("Неверный пароль"), content_type="text/html", status=401)
-
-
-async def admin_logout(request: web.Request):
-    resp = web.HTTPFound("/admin/login")
-    resp.del_cookie(ADMIN_COOKIE_NAME)
-    return resp
-
-
-async def admin_dashboard(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-
-    rows = []
-    for conn_id, info in connections.items():
-        uname = f"@{info['username']}" if info['username'] else "—"
-        count = sum(1 for (cid, _mid) in cache if cid == conn_id)
-        rows.append(
-            f"<tr><td>#{info.get('num', '?')}</td><td>{html_mod.escape(info['user_name'])}</td>"
-            f"<td>{html_mod.escape(uname)}</td><td><code>{info['user_id']}</code></td>"
-            f"<td>{count}</td>"
-            f'<td><a href="/admin/connection/{conn_id}">Открыть</a></td></tr>'
-        )
-    conn_table = (
-        "<table><tr><th>#</th><th>Имя</th><th>Username</th><th>ID</th><th>Сообщений</th><th></th></tr>"
-        + "".join(rows) + "</table>"
-    ) if rows else '<p class="muted">Нет подключений.</p>'
-
-    mon_rows = []
-    for acc, info in monitors.items():
-        excl = ", ".join(f"@{e}" for e in info.get("excludes", [])) or "—"
-        mon_rows.append(
-            f"<tr><td>@{html_mod.escape(acc)}</td><td>{info.get('added_at', '?')}</td><td>{excl}</td>"
-            f'<td><form method="post" action="/admin/monitors/remove/{acc}">'
-            f'<button type="submit">Убрать</button></form></td></tr>'
-        )
-    mon_table = (
-        "<table><tr><th>Аккаунт</th><th>С</th><th>Исключения</th><th></th></tr>" + "".join(mon_rows) + "</table>"
-    ) if mon_rows else '<p class="muted">Мониторинг не настроен.</p>'
-
-    body = f"""
-    <div class="card"><h1>📊 Статус</h1>
-      <p class="muted">Подключений: {len(connections)} · Сообщений в кеше: {len(cache)} · Мониторингов: {len(monitors)}</p>
-      <p><a href="/admin/search">🔍 Поиск по всем чатам</a> · <a href="/admin/stats">📈 Статистика</a></p>
-    </div>
-    <div class="card"><h2>👥 Подключения</h2>{conn_table}</div>
-    <div class="card"><h2>📋 Мониторинг</h2>{mon_table}
-      <form method="post" action="/admin/monitors/add">
-        <input name="username" placeholder="username без @">
-        <button type="submit">Добавить</button>
-      </form>
-    </div>
-    """
-    return web.Response(text=_admin_page("Exoway — admin", body), content_type="text/html")
-
-
-async def admin_connection(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    conn_id = request.match_info["conn_id"]
-    owner = connections.get(conn_id)
-    if not owner:
-        return web.Response(text="Подключение не найдено", status=404)
-
-    chats: dict[str, dict] = {}
-    for (cid, msg_id), data in cache.items():
-        if cid != conn_id:
-            continue
-        chat_uname_raw = (data.get("chat_uname") or "").strip(" ()@").lower()
-        key = chat_uname_raw or f"noname_{data.get('chat_name', '')}"
-        entry = chats.setdefault(key, {
-            "title": (data.get("chat_name") or "") + (data.get("chat_uname") or ""),
-            "count": 0,
-            "uname": chat_uname_raw,
-        })
-        entry["count"] += 1
-
-    rows = []
-    for key, info in sorted(chats.items(), key=lambda x: -x[1]["count"]):
-        if info["uname"]:
-            link = (
-                f'<a href="/admin/connection/{conn_id}/view?chat={info["uname"]}">Просмотр</a> · '
-                f'<a href="/admin/connection/{conn_id}/info?chat={info["uname"]}">Инфо</a> · '
-                f'<a href="/admin/connection/{conn_id}/export?chat={info["uname"]}">Скачать HTML</a>'
-            )
-        else:
-            link = '<span class="muted">нет username, недоступно</span>'
-        rows.append(f"<tr><td>{html_mod.escape(info['title'])}</td><td>{info['count']}</td><td>{link}</td></tr>")
-
-    table = (
-        "<table><tr><th>Собеседник</th><th>Сообщений</th><th></th></tr>" + "".join(rows) + "</table>"
-    ) if rows else '<p class="muted">В кеше пока ничего нет для этого подключения.</p>'
-
-    body = f"""
-    <p><a href="/admin">← Назад</a></p>
-    <div class="card">
-      <h1>{html_mod.escape(owner['user_name'])} {f"(@{html_mod.escape(owner['username'])})" if owner['username'] else ""}</h1>
-      <p class="muted">ID: <code>{owner['user_id']}</code> · #{owner.get('num', '?')}</p>
-      {table}
-    </div>
-    """
-    return web.Response(text=_admin_page(f"{owner['user_name']} — Exoway admin", body), content_type="text/html")
-
-
-def _conn_chat_entries(conn_id: str, username: str) -> tuple[list[tuple[int, dict]], str]:
-    entries = []
-    chat_title = ""
-    for (cid, msg_id), data in cache.items():
-        if cid != conn_id:
-            continue
-        chat_uname_raw = (data.get("chat_uname") or "").strip(" ()@").lower()
-        if chat_uname_raw != username:
-            continue
-        entries.append((msg_id, data))
-        if not chat_title:
-            chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
-    entries.sort(key=lambda item: item[1]["sent_at"])
-    return entries, (chat_title or f"@{username}")
-
-
-async def admin_export(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    conn_id = request.match_info["conn_id"]
-    owner = connections.get(conn_id)
-    if not owner:
-        return web.Response(text="Подключение не найдено", status=404)
-    username = request.query.get("chat", "").strip(" @").lower()
-    if not username:
-        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
-
-    entries, chat_title = _conn_chat_entries(conn_id, username)
-    if not entries:
-        return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
-
-    html_doc = await build_transcript_html(chat_title, entries, owner["user_id"])
-    return web.Response(
-        text=html_doc,
-        content_type="text/html",
-        headers={"Content-Disposition": f'inline; filename="chat_{username}.html"'},
-    )
-
-
-CHAT_PAGE_SIZE = 150
-
-
-async def admin_view(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    conn_id = request.match_info["conn_id"]
-    owner = connections.get(conn_id)
-    if not owner:
-        return web.Response(text="Подключение не найдено", status=404)
-    username = request.query.get("chat", "").strip(" @").lower()
-    if not username:
-        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
-
-    entries, chat_title = _conn_chat_entries(conn_id, username)
-    if not entries:
-        return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
-
-    total_pages = max(1, (len(entries) + CHAT_PAGE_SIZE - 1) // CHAT_PAGE_SIZE)
-    page_param = request.query.get("page")
-    page = int(page_param) if page_param and page_param.isdigit() else total_pages
-    page = max(1, min(page, total_pages))
-    start = (page - 1) * CHAT_PAGE_SIZE
-    page_entries = entries[start:start + CHAT_PAGE_SIZE]
-
-    rows = await build_transcript_rows(page_entries, owner["user_id"])
-
-    nav = []
-    if page > 1:
-        nav.append(f'<a href="/admin/connection/{conn_id}/view?chat={username}&page={page - 1}">← Раньше</a>')
-    else:
-        nav.append('<span></span>')
-    nav.append(f'<span class="muted">Страница {page} из {total_pages} · сообщений: {len(entries)}</span>')
-    if page < total_pages:
-        nav.append(f'<a href="/admin/connection/{conn_id}/view?chat={username}&page={page + 1}">Позже →</a>')
-    else:
-        nav.append('<span></span>')
-
-    body = f"""
-    <p><a href="/admin/connection/{conn_id}">← Назад</a></p>
-    <style>{CHAT_ROWS_CSS}</style>
-    <div class="card">
-      <h1>💬 {html_mod.escape(chat_title)}</h1>
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px;">{"".join(nav)}</div>
-      <div class="chat">{rows}</div>
-    </div>
-    """
-    return web.Response(text=_admin_page(f"{chat_title} — Exoway admin", body), content_type="text/html")
-
-
-async def admin_info_view(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    conn_id = request.match_info["conn_id"]
-    owner = connections.get(conn_id)
-    if not owner:
-        return web.Response(text="Подключение не найдено", status=404)
-    username = request.query.get("chat", "").strip(" @").lower()
-    if not username:
-        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
-
-    entries, chat_title = _conn_chat_entries(conn_id, username)
-    if not entries:
-        return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
-
-    found = scan_info(entries)
-    sections = []
-    total = 0
-    for label, items in found.items():
-        if not items:
-            continue
-        item_rows = []
-        for time_str, sender, full_text in items[:10]:
-            total += 1
-            shown = full_text[:3000] + ("…" if len(full_text) > 3000 else "")
-            item_rows.append(
-                f'<div style="margin:10px 0;"><div class="muted">{time_str} — <b>{html_mod.escape(sender)}</b></div>'
-                f'<blockquote style="margin:4px 0 0; padding:8px 12px; background:rgba(255,255,255,0.05); '
-                f'border-left:3px solid #2b5278; border-radius:6px; white-space:pre-wrap;">{html_mod.escape(shown)}</blockquote></div>'
-            )
-        sections.append(f'<div class="card"><h2>{label}</h2>{"".join(item_rows)}</div>')
-
-    sections_html = "".join(sections) if total else '<div class="card"><p class="muted">Совпадений по ключевым словам нет.</p></div>'
-
-    body = f"""
-    <p><a href="/admin/connection/{conn_id}">← Назад</a></p>
-    <div class="card"><h1>{KEY_MOMENTS} Ключевые моменты — {html_mod.escape(chat_title)}</h1>
-      <p class="muted">{WARNING} Поиск по ключевым словам в тексте, не реальный анализ.</p>
-    </div>
-    {sections_html}
-    """
-    return web.Response(text=_admin_page(f"Info {chat_title} — Exoway admin", body), content_type="text/html")
-
-
-async def admin_search(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    query = request.query.get("q", "").strip()
-    results = []
-    if query:
-        q_lower = query.lower()
-        for (conn_id, msg_id), data in cache.items():
-            text = data.get("text", "")
-            if text and q_lower in text.lower():
-                owner = connections.get(conn_id)
-                results.append((data["sent_at"], conn_id, owner, data))
-        results.sort(key=lambda x: x[0], reverse=True)
-
-    rows = []
-    for sent_at, conn_id, owner, data in results[:200]:
-        chat = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
-        sender = data.get("sender_name", "?")
-        owner_label = owner["user_name"] if owner else "?"
-        snippet = data.get("text", "")
-        idx = snippet.lower().find(query.lower())
-        start = max(0, idx - 40)
-        excerpt = ("…" if start > 0 else "") + snippet[start:start + 120] + ("…" if start + 120 < len(snippet) else "")
-        rows.append(
-            f"<tr><td>{fmt(sent_at)}</td><td>{html_mod.escape(owner_label)}</td>"
-            f"<td>{html_mod.escape(chat)}</td><td>{html_mod.escape(sender)}</td>"
-            f"<td>{html_mod.escape(excerpt)}</td>"
-            f'<td><a href="/admin/connection/{conn_id}">Открыть</a></td></tr>'
-        )
-    table = (
-        "<table><tr><th>Время</th><th>Аккаунт</th><th>Чат</th><th>Отправитель</th><th>Текст</th><th></th></tr>"
-        + "".join(rows) + "</table>"
-    ) if rows else '<p class="muted">Ничего не найдено.</p>'
-
-    body = f"""
-    <p><a href="/admin">← Назад</a></p>
-    <div class="card"><h1>🔍 Поиск по всем чатам</h1>
-      <form method="get" action="/admin/search">
-        <input name="q" value="{html_mod.escape(query)}" placeholder="текст для поиска" style="min-width:240px">
-        <button type="submit">Искать</button>
-      </form>
-      <p class="muted">{f"Найдено: {len(results)}" if query else "Введите текст, чтобы искать по всем подключениям сразу"}</p>
-      {table}
-    </div>
-    """
-    return web.Response(text=_admin_page("Поиск — Exoway admin", body), content_type="text/html")
-
-
-async def admin_stats(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-
-    now = datetime.now(MSK)
-    days = [(now - timedelta(days=i)).date() for i in range(13, -1, -1)]
-    per_day = Counter()
-    top_chats = Counter()
-    for data in cache.values():
-        sent_at = data.get("sent_at")
-        if sent_at:
-            per_day[sent_at.date()] += 1
-        chat = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
-        if chat:
-            top_chats[chat] += 1
-
-    max_count = max((per_day.get(d, 0) for d in days), default=0) or 1
-    bars = []
-    for d in days:
-        count = per_day.get(d, 0)
-        height = int(4 + (count / max_count) * 120)
-        bars.append(
-            f'<div style="display:flex; flex-direction:column; align-items:center; gap:4px; flex:1;">'
-            f'<div title="{count}" style="width:100%; max-width:28px; height:{height}px; '
-            f'background:#2b5278; border-radius:4px 4px 0 0;"></div>'
-            f'<div class="muted" style="font-size:10px;">{d.strftime("%d.%m")}</div>'
-            f'</div>'
-        )
-    chart = f'<div style="display:flex; align-items:flex-end; gap:6px; height:150px;">{"".join(bars)}</div>'
-
-    top_rows = "".join(
-        f"<tr><td>{html_mod.escape(chat)}</td><td>{count}</td></tr>"
-        for chat, count in top_chats.most_common(10)
-    )
-    top_table = (
-        f"<table><tr><th>Собеседник</th><th>Сообщений</th></tr>{top_rows}</table>"
-        if top_rows else '<p class="muted">Пусто.</p>'
-    )
-
-    body = f"""
-    <p><a href="/admin">← Назад</a></p>
-    <div class="card"><h1>📈 Статистика</h1>
-      <p class="muted">Сообщений в кеше: {len(cache)} · авточистка старше {CACHE_MAX_AGE_DAYS} дн.</p>
-    </div>
-    <div class="card"><h2>Сообщений по дням (14 дней)</h2>{chart}</div>
-    <div class="card"><h2>Топ собеседников</h2>{top_table}</div>
-    """
-    return web.Response(text=_admin_page("Статистика — Exoway admin", body), content_type="text/html")
-
-
-async def admin_monitor_add(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    data = await request.post()
-    username = data.get("username", "").strip(" @").lower()
-    if username:
-        if username not in monitors:
-            monitors[username] = {"added_at": fmt(datetime.now(MSK)), "excludes": []}
-        else:
-            monitors[username]["added_at"] = fmt(datetime.now(MSK))
-        save_monitors()
-    return web.HTTPFound("/admin")
-
-
-async def admin_monitor_remove(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    username = request.match_info["username"]
-    if username in monitors:
-        del monitors[username]
-        save_monitors()
-    return web.HTTPFound("/admin")
 
 
 async def main():
@@ -2631,18 +2153,6 @@ async def main():
     async def health(request):
         return web.Response(text="OK")
     app.router.add_get("/", health)
-    app.router.add_get("/admin", admin_dashboard)
-    app.router.add_get("/admin/login", admin_login_get)
-    app.router.add_post("/admin/login", admin_login_post)
-    app.router.add_get("/admin/logout", admin_logout)
-    app.router.add_get("/admin/connection/{conn_id}", admin_connection)
-    app.router.add_get("/admin/connection/{conn_id}/export", admin_export)
-    app.router.add_get("/admin/connection/{conn_id}/view", admin_view)
-    app.router.add_get("/admin/connection/{conn_id}/info", admin_info_view)
-    app.router.add_get("/admin/search", admin_search)
-    app.router.add_get("/admin/stats", admin_stats)
-    app.router.add_post("/admin/monitors/add", admin_monitor_add)
-    app.router.add_post("/admin/monitors/remove/{username}", admin_monitor_remove)
 
     if domain and port:
         # ─── Railway: webhook ─────────────────────────────
