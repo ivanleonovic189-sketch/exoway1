@@ -385,9 +385,138 @@ def save_monitors():
 
 load_monitors()
 
+REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
+reminders: list[dict] = []
+reminder_counter: int = 0
+
+
+def load_reminders():
+    global reminders, reminder_counter
+    try:
+        with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
+            reminders = json.load(f)
+        reminder_counter = max((r["id"] for r in reminders), default=0)
+    except (FileNotFoundError, json.JSONDecodeError):
+        reminders = []
+
+
+def save_reminders():
+    with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(reminders, f, ensure_ascii=False, indent=2)
+
+
+def next_reminder_id() -> int:
+    global reminder_counter
+    reminder_counter += 1
+    return reminder_counter
+
+
+load_reminders()
+
+DIGEST_HOUR_MSK = int(os.getenv("DIGEST_HOUR_MSK", "21"))  # во сколько слать ежедневную сводку, по МСК
+
 
 def fmt(dt: datetime) -> str:
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
+
+
+# ─── Парсер времени для /remind (всё по МСК) ──────────────────
+_WEEKDAYS_RU = {
+    "понедельник": 0, "вторник": 1, "среду": 2, "четверг": 3,
+    "пятницу": 4, "субботу": 5, "воскресенье": 6,
+}
+
+
+def parse_remind_time(text: str, now: datetime) -> tuple[datetime | None, str]:
+    """Разбирает ведущее время в тексте (по МСК). Возвращает (due_at, остаток_текста) или (None, text)."""
+    text = text.strip()
+
+    m = re.match(r'^через\s+(\d+)\s*(минут\w*|мин\.?|час(?:а|ов)?|недел\w*|день|дн\w*)\s+(.*)$', text, re.IGNORECASE)
+    if m:
+        amount = int(m.group(1))
+        unit = m.group(2).lower()
+        rest = m.group(3)
+        if unit.startswith("мин"):
+            delta = timedelta(minutes=amount)
+        elif unit.startswith("час"):
+            delta = timedelta(hours=amount)
+        elif unit.startswith("недел"):
+            delta = timedelta(weeks=amount)
+        else:
+            delta = timedelta(days=amount)
+        return now + delta, rest
+
+    m = re.match(r'^(сегодня|завтра|послезавтра)\s+в\s+(\d{1,2})[:.](\d{2})\s+(.*)$', text, re.IGNORECASE)
+    if m:
+        day_word, hh, mm, rest = m.group(1).lower(), int(m.group(2)), int(m.group(3)), m.group(4)
+        offset = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[day_word]
+        try:
+            target_date = (now + timedelta(days=offset)).date()
+            due = datetime.combine(target_date, datetime.min.time()).replace(hour=hh, minute=mm, tzinfo=MSK)
+        except ValueError:
+            return None, text
+        return due, rest
+
+    m = re.match(
+        r'^в\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)'
+        r'(?:\s+в\s+(\d{1,2})[:.](\d{2}))?\s+(.*)$',
+        text, re.IGNORECASE
+    )
+    if m:
+        weekday_name, hh, mm, rest = m.group(1).lower(), m.group(2), m.group(3), m.group(4)
+        target_wd = _WEEKDAYS_RU[weekday_name]
+        days_ahead = (target_wd - now.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        try:
+            target_date = (now + timedelta(days=days_ahead)).date()
+            hour = int(hh) if hh else 9
+            minute = int(mm) if mm else 0
+            due = datetime.combine(target_date, datetime.min.time()).replace(hour=hour, minute=minute, tzinfo=MSK)
+        except ValueError:
+            return None, text
+        return due, rest
+
+    m = re.match(r'^в\s+(\d{1,2})[:.](\d{2})\s+(.*)$', text, re.IGNORECASE)
+    if m:
+        hh, mm, rest = int(m.group(1)), int(m.group(2)), m.group(3)
+        try:
+            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except ValueError:
+            return None, text
+        if due <= now:
+            due += timedelta(days=1)
+        return due, rest
+
+    m = re.match(r'^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+(?:в\s+)?(\d{1,2})[:.](\d{2})\s+(.*)$', text)
+    if m:
+        day, month, year, hh, mm, rest = m.groups()
+        year = int(year) if year else now.year
+        if year < 100:
+            year += 2000
+        try:
+            due = datetime(year, int(month), int(day), int(hh), int(mm), tzinfo=MSK)
+        except ValueError:
+            return None, text
+        if due <= now:
+            due = due.replace(year=due.year + 1)
+        return due, rest
+
+    m = re.match(r'^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+(.*)$', text)
+    if m:
+        day, month, year, rest = m.groups()
+        year = int(year) if year else now.year
+        if year < 100:
+            year += 2000
+        try:
+            due = datetime(year, int(month), int(day), 9, 0, tzinfo=MSK)
+        except ValueError:
+            return None, text
+        if due <= now:
+            due = due.replace(year=due.year + 1)
+        return due, rest
+
+    return None, text
 
 
 def get_user_num(uid: int) -> int:
@@ -1298,7 +1427,9 @@ async def cmd_last(message: Message):
         await message.answer(chunk, parse_mode="HTML")
 
 
-def find_own_conversation(requester_id: int, username: str) -> tuple[list[tuple[int, dict]], str]:
+def find_own_conversation(
+    requester_id: int, username: str, since: datetime | None = None
+) -> tuple[list[tuple[int, dict]], str]:
     """Сообщения из СОБСТВЕННОГО бизнес-подключения запросившего с конкретным собеседником @username."""
     entries = []
     chat_title = ""
@@ -1308,11 +1439,23 @@ def find_own_conversation(requester_id: int, username: str) -> tuple[list[tuple[
         chat_uname_raw = (data.get("chat_uname") or "").strip(" ()@").lower()
         if chat_uname_raw != username:
             continue
+        if since and data.get("sent_at") and data["sent_at"] < since:
+            continue
         entries.append((msg_id, data))
         if not chat_title:
             chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
     entries.sort(key=lambda item: item[1]["sent_at"])
     return entries, (chat_title or f"@{username}")
+
+
+def parse_since_token(text: str) -> tuple[datetime | None, str | None]:
+    """Ищет в тексте период вида 7d / 2w / 24h (по МСК) и возвращает (since, исходный токен)."""
+    m = re.search(r'\b(\d+)\s*([dhw])\b', text, re.IGNORECASE)
+    if not m:
+        return None, None
+    amount, unit = int(m.group(1)), m.group(2).lower()
+    delta = {"h": timedelta(hours=amount), "d": timedelta(days=amount), "w": timedelta(weeks=amount)}[unit]
+    return datetime.now(MSK) - delta, m.group(0)
 
 
 @dp.message(Command("export"))
@@ -1321,15 +1464,19 @@ async def cmd_export(message: Message):
     match = re.search(r'@(\w+)', text)
     if not match:
         await message.answer(
-            "📋 <code>/export @username</code>\nСохранит переписку с этим собеседником в HTML-файл на память.",
+            "📋 <code>/export @username [7d]</code>\n"
+            "Сохранит переписку с этим собеседником в HTML-файл на память.\n"
+            "Можно ограничить период: <code>24h</code> / <code>7d</code> / <code>2w</code>.",
             parse_mode="HTML"
         )
         return
     username = match.group(1).lower()
+    since, since_token = parse_since_token(text)
 
-    entries, chat_title = find_own_conversation(message.from_user.id, username)
+    entries, chat_title = find_own_conversation(message.from_user.id, username, since)
     if not entries:
-        await message.answer(f"📭 Нет сообщений с @{username} в кеше.")
+        period_note = f" за последние {since_token}" if since_token else ""
+        await message.answer(f"📭 Нет сообщений с @{username}{period_note} в кеше.")
         return
 
     await message.answer(
@@ -1337,14 +1484,170 @@ async def cmd_export(message: Message):
         parse_mode="HTML"
     )
 
+    period_line = f"├ Период: <b>последние {since_token}</b>\n" if since_token else ""
     caption = (
         f"{EXPORT_DONE} <b>Экспорт переписки готов</b>\n"
         f"├ Чат с: <b>{html_mod.escape(chat_title)}</b>\n"
+        f"{period_line}"
         f"├ Сообщений: <b>{len(entries)}</b>\n"
         f"└ Сформировано: <b>{fmt(datetime.now(MSK))}</b>\n\n"
         f"📎 Полная переписка во вложении"
     )
     await send_transcript_document(message.chat.id, chat_title, entries, message.from_user.id, caption)
+
+
+# ─── /remind — напоминания (время всегда по МСК) ──────────────
+@dp.message(Command("remind"))
+async def cmd_remind(message: Message):
+    text = message.text or ""
+    body = re.sub(r'^/remind(@\w+)?\s*', '', text, flags=re.IGNORECASE)
+    if not body.strip():
+        await message.answer(
+            "📋 <code>/remind завтра в 18:00 позвонить другу</code>\n"
+            "Понимаю: <code>через 20 минут</code>, <code>завтра в 9:00</code>, "
+            "<code>в пятницу в 15:00</code>, <code>25.12 в 10:00</code>.\n"
+            "Время всегда по МСК.",
+            parse_mode="HTML"
+        )
+        return
+
+    due_at, reminder_text = parse_remind_time(body, datetime.now(MSK))
+    if not due_at:
+        await message.answer(
+            f"{WARNING} Не понял время. Примеры: <code>/remind через час отдохнуть</code>, "
+            f"<code>/remind завтра в 9:00 звонок</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    reminder_text = reminder_text.strip() or "⏰ Напоминание"
+    rid = next_reminder_id()
+    reminders.append({
+        "id": rid,
+        "user_id": message.from_user.id,
+        "chat_id": message.chat.id,
+        "text": reminder_text,
+        "due_at": due_at.isoformat(),
+        "created_at": datetime.now(MSK).isoformat(),
+    })
+    save_reminders()
+    await message.answer(
+        f"{EXPORT_DONE} Напомню <b>{fmt(due_at)}</b> (МСК) [#{rid}]:\n«{html_mod.escape(reminder_text)}»",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("reminders"))
+async def cmd_reminders(message: Message):
+    mine = [r for r in reminders if r["user_id"] == message.from_user.id]
+    if not mine:
+        await message.answer("📭 Нет активных напоминаний.")
+        return
+    mine.sort(key=lambda r: r["due_at"])
+    lines = ["⏰ <b>Твои напоминания (МСК):</b>\n"]
+    for r in mine:
+        due = datetime.fromisoformat(r["due_at"])
+        lines.append(f"#{r['id']} · {fmt(due)} — {html_mod.escape(r['text'])}")
+    lines.append("\nОтменить: <code>/cancelreminder ID</code>")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("cancelreminder"))
+async def cmd_cancel_reminder(message: Message):
+    text = message.text or ""
+    m = re.search(r'(\d+)', text)
+    if not m:
+        await message.answer("📋 <code>/cancelreminder ID</code>", parse_mode="HTML")
+        return
+    rid = int(m.group(1))
+    before = len(reminders)
+    reminders[:] = [r for r in reminders if not (r["id"] == rid and r["user_id"] == message.from_user.id)]
+    if len(reminders) < before:
+        save_reminders()
+        await message.answer(f"✅ Напоминание #{rid} отменено.")
+    else:
+        await message.answer(f"{WARNING} Напоминание #{rid} не найдено.", parse_mode="HTML")
+
+
+async def reminder_loop():
+    while True:
+        await asyncio.sleep(30)
+        now = datetime.now(MSK)
+        due = [r for r in reminders if datetime.fromisoformat(r["due_at"]) <= now]
+        for r in due:
+            try:
+                await bot.send_message(
+                    r["chat_id"],
+                    f"⏰ <b>Напоминание</b>\n{html_mod.escape(r['text'])}",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logging.warning(f"reminder send failed: {e}")
+            reminders.remove(r)
+        if due:
+            save_reminders()
+
+
+# ─── Ежедневная сводка (МСК) ───────────────────────────────────
+async def send_daily_digest(conn_id: str, owner_id: int, now: datetime):
+    today = now.date()
+    todays_entries = [
+        data for (cid, _mid), data in cache.items()
+        if cid == conn_id and data.get("sent_at") and data["sent_at"].date() == today
+    ]
+    if not todays_entries:
+        return
+
+    incoming = [d for d in todays_entries if d.get("sender_id") != owner_id]
+    if not incoming:
+        return
+    senders = {d["sender_id"] for d in incoming if d.get("sender_id")}
+
+    earlier_senders = {
+        data["sender_id"]
+        for (cid, _mid), data in cache.items()
+        if cid == conn_id and data.get("sent_at") and data["sent_at"].date() < today and data.get("sender_id")
+    }
+    new_senders = senders - earlier_senders
+
+    lines = [
+        f"📅 <b>Итоги дня</b> — {now.strftime('%d.%m.%Y')} (МСК)\n",
+        f"├ Сообщений получено: <b>{len(incoming)}</b>",
+        f"├ Собеседников сегодня: <b>{len(senders)}</b>",
+    ]
+    if new_senders:
+        names = []
+        for sid in new_senders:
+            match_data = next((d for d in incoming if d.get("sender_id") == sid), None)
+            if match_data:
+                nm = match_data["sender_name"]
+                if match_data.get("sender_username"):
+                    nm += f" ({match_data['sender_username']})"
+                names.append(nm)
+        lines.append(f"└ 🆕 Новые контакты: <b>{len(new_senders)}</b> — {html_mod.escape(', '.join(names))}")
+    else:
+        lines.append("└ 🆕 Новых контактов нет")
+
+    try:
+        await bot.send_message(owner_id, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"digest send failed for {owner_id}: {e}")
+
+
+async def digest_loop():
+    sent_dates: dict[int, str] = {}
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(MSK)
+        if now.hour != DIGEST_HOUR_MSK:
+            continue
+        today_str = now.strftime("%Y-%m-%d")
+        for conn_id, owner in list(connections.items()):
+            owner_id = owner["user_id"]
+            if sent_dates.get(owner_id) == today_str:
+                continue
+            await send_daily_digest(conn_id, owner_id, now)
+            sent_dates[owner_id] = today_str
 
 
 # ─── /info — ключевые моменты по ключевым словам ──────────────
@@ -1458,20 +1761,24 @@ async def cmd_info(message: Message):
     match = re.search(r'@(\w+)', text)
     if not match:
         await message.answer(
-            "📋 <code>/info @username</code>\n"
-            "Поищет в переписке возраст, дату рождения, симпатии, желания и т.п. по ключевым словам.",
+            "📋 <code>/info @username [7d]</code>\n"
+            "Поищет в переписке возраст, дату рождения, симпатии, желания и т.п. по ключевым словам.\n"
+            "Можно ограничить период: <code>24h</code> / <code>7d</code> / <code>2w</code>.",
             parse_mode="HTML"
         )
         return
     username = match.group(1).lower()
+    since, since_token = parse_since_token(text)
 
-    entries, chat_title = find_own_conversation(message.from_user.id, username)
+    entries, chat_title = find_own_conversation(message.from_user.id, username, since)
     if not entries:
-        await message.answer(f"📭 Нет сообщений с @{username} в кеше.")
+        period_note = f" за последние {since_token}" if since_token else ""
+        await message.answer(f"📭 Нет сообщений с @{username}{period_note} в кеше.")
         return
 
     found = scan_info(entries)
-    lines = [f"{KEY_MOMENTS} <b>Ключевые моменты — {html_mod.escape(chat_title)}</b>"]
+    period_line = f" (последние {since_token})" if since_token else ""
+    lines = [f"{KEY_MOMENTS} <b>Ключевые моменты — {html_mod.escape(chat_title)}{period_line}</b>"]
     total = 0
     for label, items in found.items():
         if not items:
@@ -1594,7 +1901,9 @@ async def cmd_start(message: Message):
             "/exclude @user @chat — исключить чат\n"
             "/include @user @chat — вернуть чат\n"
             "/last @user 10 — последние сообщения\n"
-            "/export @user — вся переписка в HTML-файл\n"
+            "/export @user [7d] — вся переписка в HTML-файл\n"
+            "/remind — напоминание (МСК)\n"
+            "/reminders — список напоминаний\n"
             "/monitors — список\n"
             "/users — подключённые"
             f"{admin_line}",
@@ -1606,8 +1915,12 @@ async def cmd_start(message: Message):
             "Подключи в <b>Настройки → Telegram Business → Чат-боты</b> "
             "и я буду пересылать тебе удалённые и изменённые сообщения.\n\n"
             "<b>Команды:</b>\n"
-            "/export @user — сохранить переписку с человеком в HTML-файл на память\n"
-            "/info @user — найти в переписке ключевые моменты (возраст, симпатии, желания и т.п.)",
+            "/export @user [7d] — сохранить переписку с человеком в HTML-файл на память\n"
+            "/info @user [7d] — найти в переписке ключевые моменты (возраст, симпатии, желания и т.п.)\n"
+            "/remind завтра в 18:00 текст — напоминание (время по МСК)\n"
+            "/reminders — список напоминаний\n"
+            "/cancelreminder ID — отменить напоминание\n\n"
+            "Раз в день (в 21:00 МСК) присылаю сводку за день по каждому подключённому чату.",
             parse_mode="HTML"
         )
 
@@ -2084,6 +2397,8 @@ async def main():
 
     await bot.delete_webhook()
     asyncio.create_task(cache_cleanup_loop())
+    asyncio.create_task(reminder_loop())
+    asyncio.create_task(digest_loop())
 
     # Загружаем кастомные эмодзи
     global custom_emoji_love, custom_emoji_mad
