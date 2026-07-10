@@ -52,6 +52,7 @@ EMOJI_INFO_AGE_ID = "5395444514028529554"
 EMOJI_INFO_WANT_ID = "5397782960512444700"
 EMOJI_INFO_DISLIKE_ID = "5210952531676504517"
 EMOJI_INFO_LOCATION_ID = "5416041192905265756"
+EMOJI_INFO_JOB_ID = "5451882707875276247"
 
 
 def pemoji(emoji_id: str, fallback: str) -> str:
@@ -70,6 +71,7 @@ INFO_AGE = pemoji(EMOJI_INFO_AGE_ID, "🎂")
 INFO_WANT = pemoji(EMOJI_INFO_WANT_ID, "🎯")
 INFO_DISLIKE = pemoji(EMOJI_INFO_DISLIKE_ID, "🚫")
 INFO_LOCATION = pemoji(EMOJI_INFO_LOCATION_ID, "📍")
+INFO_JOB = pemoji(EMOJI_INFO_JOB_ID, "💼")
 
 
 def quote_block(text: str, expandable: bool = True) -> str:
@@ -1331,7 +1333,7 @@ INFO_PATTERNS = [
     (f"{INFO_LOCATION} Место / город", [
         r'(?:я\s+из|живу\s+в)\s+([^\n.,!?]{1,40})',
     ]),
-    ("💼 Работа / учёба", [
+    (f"{INFO_JOB} Работа / учёба", [
         r'(?:работаю|учусь)\s+([^\n.,!?]{1,50})',
     ]),
 ]
