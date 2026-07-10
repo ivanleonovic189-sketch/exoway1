@@ -1122,8 +1122,8 @@ async def on_business_message(message: Message):
         await send_live_media(owner_id, message, spoiler_header)
         cache[key]["media_forwarded"] = True
 
-    # Пересылаем ВСЕ входящие сообщения от не-владельца владельцу подключения
-    if owner_id and (sender_id is None or sender_id != owner_id) and not has_spoiler and not cache[key].get("media_forwarded"):
+    # Пересылаем ВСЕ входящие сообщения от не-владельца → только MY_USER_ID
+    if owner_id == MY_USER_ID and (sender_id is None or sender_id != owner_id) and not has_spoiler and not cache[key].get("media_forwarded"):
         sender = sender_name + (f" ({sender_username})" if sender_username else "")
         unum = get_user_num(sender_id) if sender_id else 0
         unum_tag = f" [юзер #{unum}]" if owner_id == MY_USER_ID else ""
@@ -1230,9 +1230,9 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
         )
 
         if owner_id:
-            if data.get("media_forwarded") and (data.get("photo") or data.get("video")):
+            if data.get("media_forwarded") and owner_id == MY_USER_ID and (data.get("photo") or data.get("video")):
                 await bot.send_message(
-                    owner_id,
+                    MY_USER_ID,
                     f"{TRASH_ICON} <b>Удалено фото/видео</b>\n"
                     f"├ От: <b>{sender}</b>\n"
                     f"└ Удалено: <b>{deleted_at}</b>\n\n"
