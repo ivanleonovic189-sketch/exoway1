@@ -15,7 +15,9 @@ from pathlib import Path
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    BufferedInputFile, Message, BusinessMessagesDeleted, BusinessConnection
+    BufferedInputFile, Message, BusinessMessagesDeleted, BusinessConnection,
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery,
 )
 from aiogram.filters import Command, BaseFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -1458,9 +1460,7 @@ def parse_since_token(text: str) -> tuple[datetime | None, str | None]:
     return datetime.now(MSK) - delta, m.group(0)
 
 
-@dp.message(Command("export"))
-async def cmd_export(message: Message):
-    text = message.text or ""
+async def run_export(message: Message, text: str):
     match = re.search(r'@(\w+)', text)
     if not match:
         await message.answer(
@@ -1496,11 +1496,13 @@ async def cmd_export(message: Message):
     await send_transcript_document(message.chat.id, chat_title, entries, message.from_user.id, caption)
 
 
+@dp.message(Command("export"))
+async def cmd_export(message: Message):
+    await run_export(message, message.text or "")
+
+
 # ─── /remind — напоминания (время всегда по МСК) ──────────────
-@dp.message(Command("remind"))
-async def cmd_remind(message: Message):
-    text = message.text or ""
-    body = re.sub(r'^/remind(@\w+)?\s*', '', text, flags=re.IGNORECASE)
+async def run_remind(message: Message, body: str):
     if not body.strip():
         await message.answer(
             "📋 <code>/remind завтра в 18:00 позвонить другу</code>\n"
@@ -1514,8 +1516,8 @@ async def cmd_remind(message: Message):
     due_at, reminder_text = parse_remind_time(body, datetime.now(MSK))
     if not due_at:
         await message.answer(
-            f"{WARNING} Не понял время. Примеры: <code>/remind через час отдохнуть</code>, "
-            f"<code>/remind завтра в 9:00 звонок</code>",
+            f"{WARNING} Не понял время. Примеры: <code>через час отдохнуть</code>, "
+            f"<code>завтра в 9:00 звонок</code>",
             parse_mode="HTML"
         )
         return
@@ -1537,9 +1539,15 @@ async def cmd_remind(message: Message):
     )
 
 
-@dp.message(Command("reminders"))
-async def cmd_reminders(message: Message):
-    mine = [r for r in reminders if r["user_id"] == message.from_user.id]
+@dp.message(Command("remind"))
+async def cmd_remind(message: Message):
+    text = message.text or ""
+    body = re.sub(r'^/remind(@\w+)?\s*', '', text, flags=re.IGNORECASE)
+    await run_remind(message, body)
+
+
+async def run_reminders(message: Message, user_id: int):
+    mine = [r for r in reminders if r["user_id"] == user_id]
     if not mine:
         await message.answer("📭 Нет активных напоминаний.")
         return
@@ -1552,21 +1560,29 @@ async def cmd_reminders(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
-@dp.message(Command("cancelreminder"))
-async def cmd_cancel_reminder(message: Message):
-    text = message.text or ""
+@dp.message(Command("reminders"))
+async def cmd_reminders(message: Message):
+    await run_reminders(message, message.from_user.id)
+
+
+async def run_cancel_reminder(message: Message, text: str, user_id: int):
     m = re.search(r'(\d+)', text)
     if not m:
         await message.answer("📋 <code>/cancelreminder ID</code>", parse_mode="HTML")
         return
     rid = int(m.group(1))
     before = len(reminders)
-    reminders[:] = [r for r in reminders if not (r["id"] == rid and r["user_id"] == message.from_user.id)]
+    reminders[:] = [r for r in reminders if not (r["id"] == rid and r["user_id"] == user_id)]
     if len(reminders) < before:
         save_reminders()
         await message.answer(f"✅ Напоминание #{rid} отменено.")
     else:
         await message.answer(f"{WARNING} Напоминание #{rid} не найдено.", parse_mode="HTML")
+
+
+@dp.message(Command("cancelreminder"))
+async def cmd_cancel_reminder(message: Message):
+    await run_cancel_reminder(message, message.text or "", message.from_user.id)
 
 
 async def reminder_loop():
@@ -1755,9 +1771,7 @@ def scan_info(entries: list[tuple[int, dict]]) -> dict[str, list[tuple[str, str,
     return found
 
 
-@dp.message(Command("info"))
-async def cmd_info(message: Message):
-    text = message.text or ""
+async def run_info(message: Message, text: str):
     match = re.search(r'@(\w+)', text)
     if not match:
         await message.answer(
@@ -1806,6 +1820,11 @@ async def cmd_info(message: Message):
         chunks.append(current)
     for chunk in chunks:
         await message.answer(chunk, parse_mode="HTML")
+
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+    await run_info(message, message.text or "")
 
 
 @dp.message(Command("exclude"))
@@ -1888,6 +1907,101 @@ async def cmd_debug(message: Message):
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+# ─── Кнопочное меню (без команд) ──────────────────────────────
+MENU_BUTTON_TEXT = "☰ Меню"
+pending_action: dict[int, str] = {}   # user_id -> "export" | "info" | "remind" | "cancel"
+
+
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=MENU_BUTTON_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def menu_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Экспорт переписки", callback_data="menu_export")],
+        [InlineKeyboardButton(text="🔎 Инфо по человеку", callback_data="menu_info")],
+        [InlineKeyboardButton(text="⏰ Поставить напоминание", callback_data="menu_remind")],
+        [InlineKeyboardButton(text="📋 Мои напоминания", callback_data="menu_reminders")],
+        [InlineKeyboardButton(text="🗑 Отменить напоминание", callback_data="menu_cancel")],
+    ])
+
+
+@dp.message(F.text == MENU_BUTTON_TEXT)
+async def on_menu_button(message: Message):
+    pending_action.pop(message.from_user.id, None)
+    await message.answer(
+        f"{KEY_MOMENTS} <b>Что сделать?</b>\nВыбери ниже — набирать команды не нужно.",
+        parse_mode="HTML",
+        reply_markup=menu_inline_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("menu_"))
+async def on_menu_callback(callback: CallbackQuery):
+    uid = callback.from_user.id
+    action = callback.data
+
+    if action == "menu_export":
+        pending_action[uid] = "export"
+        await callback.message.answer(
+            f"{EXPORT_PROGRESS} Напиши <code>@username</code> собеседника "
+            f"(можно добавить период: <code>7d</code> / <code>2w</code> / <code>24h</code>)",
+            parse_mode="HTML",
+        )
+    elif action == "menu_info":
+        pending_action[uid] = "info"
+        await callback.message.answer(
+            f"{KEY_MOMENTS} Напиши <code>@username</code> собеседника "
+            f"(можно добавить период: <code>7d</code> / <code>2w</code> / <code>24h</code>)",
+            parse_mode="HTML",
+        )
+    elif action == "menu_remind":
+        pending_action[uid] = "remind"
+        await callback.message.answer(
+            f"{EXPORT_DONE} Напиши, когда и что напомнить, например:\n"
+            f"<code>завтра в 18:00 позвонить другу</code>\n"
+            f"<code>через 20 минут отдохнуть</code>\n"
+            f"<code>в пятницу в 15:00 встреча</code>\n"
+            f"Время по МСК.",
+            parse_mode="HTML",
+        )
+    elif action == "menu_reminders":
+        pending_action.pop(uid, None)
+        await run_reminders(callback.message, uid)
+    elif action == "menu_cancel":
+        pending_action[uid] = "cancel"
+        await callback.message.answer(
+            f"{WARNING} Напиши ID напоминания для отмены (посмотреть — «📋 Мои напоминания»)",
+            parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@dp.message((F.chat.type == "private") & F.text & ~F.text.startswith("/"))
+async def on_pending_input(message: Message):
+    uid = message.from_user.id
+    action = pending_action.get(uid)
+    if not action:
+        return
+    pending_action.pop(uid, None)
+    text = (message.text or "").strip()
+
+    if action == "export":
+        arg = text if text.startswith("@") else f"@{text}"
+        await run_export(message, arg)
+    elif action == "info":
+        arg = text if text.startswith("@") else f"@{text}"
+        await run_info(message, arg)
+    elif action == "remind":
+        await run_remind(message, text)
+    elif action == "cancel":
+        await run_cancel_reminder(message, text, uid)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if message.from_user.id == MY_USER_ID:
@@ -1895,7 +2009,8 @@ async def cmd_start(message: Message):
         admin_line = f"\n\n🌐 Веб-админка: https://{domain}/admin" if domain and ADMIN_PASSWORD else ""
         await message.answer(
             "👁 Бот запущен.\n\n"
-            "<b>Команды:</b>\n"
+            "Нажми «☰ Меню» снизу — команды набирать не обязательно.\n\n"
+            "<b>Команды (для админа):</b>\n"
             "/check @user — мониторить ЛС\n"
             "/uncheck @user — убрать\n"
             "/exclude @user @chat — исключить чат\n"
@@ -1907,21 +2022,18 @@ async def cmd_start(message: Message):
             "/monitors — список\n"
             "/users — подключённые"
             f"{admin_line}",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=main_reply_keyboard(),
         )
     else:
         await message.answer(
             "👁 Бот активен.\n\n"
             "Подключи в <b>Настройки → Telegram Business → Чат-боты</b> "
             "и я буду пересылать тебе удалённые и изменённые сообщения.\n\n"
-            "<b>Команды:</b>\n"
-            "/export @user [7d] — сохранить переписку с человеком в HTML-файл на память\n"
-            "/info @user [7d] — найти в переписке ключевые моменты (возраст, симпатии, желания и т.п.)\n"
-            "/remind завтра в 18:00 текст — напоминание (время по МСК)\n"
-            "/reminders — список напоминаний\n"
-            "/cancelreminder ID — отменить напоминание\n\n"
+            "Нажми «☰ Меню» снизу — всё делается кнопками, команды не нужны.\n\n"
             "Раз в день (в 21:00 МСК) присылаю сводку за день по каждому подключённому чату.",
-            parse_mode="HTML"
+            parse_mode="HTML",
+            reply_markup=main_reply_keyboard(),
         )
 
 
