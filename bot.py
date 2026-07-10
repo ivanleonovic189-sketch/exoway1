@@ -1241,40 +1241,39 @@ async def cmd_last(message: Message):
         await message.answer(chunk, parse_mode="HTML")
 
 
+def find_own_conversation(requester_id: int, username: str) -> tuple[list[tuple[int, dict]], str]:
+    """Сообщения из СОБСТВЕННОГО бизнес-подключения запросившего с конкретным собеседником @username."""
+    entries = []
+    chat_title = ""
+    for (conn_id, msg_id), data in cache.items():
+        if data.get("owner_id") != requester_id:
+            continue
+        chat_uname_raw = (data.get("chat_uname") or "").strip(" ()@").lower()
+        if chat_uname_raw != username:
+            continue
+        entries.append((msg_id, data))
+        if not chat_title:
+            chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
+    entries.sort(key=lambda item: item[1]["sent_at"])
+    return entries, (chat_title or f"@{username}")
+
+
 @dp.message(Command("export"))
 async def cmd_export(message: Message):
-    if message.from_user.id != MY_USER_ID:
-        return
     text = message.text or ""
     match = re.search(r'@(\w+)', text)
     if not match:
-        await message.answer("📋 <code>/export @username</code>", parse_mode="HTML")
+        await message.answer(
+            "📋 <code>/export @username</code>\nСохранит переписку с этим собеседником в HTML-файл на память.",
+            parse_mode="HTML"
+        )
         return
     username = match.group(1).lower()
 
-    entries = []
-    owner_id_for_chat = None
-    chat_title = ""
-    for (conn_id, msg_id), data in cache.items():
-        owner = connections.get(conn_id)
-        if not owner:
-            continue
-        owner_uname = owner.get("username", "")
-        chat_uname_raw = data.get("chat_uname", "").strip(" ()@").lower()
-        sender_uname_raw = data.get("sender_username", "").strip("@").lower()
-        if username in (owner_uname, chat_uname_raw, sender_uname_raw):
-            entries.append((msg_id, data))
-            if owner_id_for_chat is None:
-                owner_id_for_chat = owner.get("user_id")
-            if not chat_title:
-                chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
-
+    entries, chat_title = find_own_conversation(message.from_user.id, username)
     if not entries:
-        await message.answer(f"📭 Нет сообщений для @{username} в кеше.")
+        await message.answer(f"📭 Нет сообщений с @{username} в кеше.")
         return
-
-    entries.sort(key=lambda item: item[1]["sent_at"])
-    chat_title = chat_title or f"@{username}"
 
     await message.answer(f"⏳ Готовлю переписку с @{username} ({len(entries)} сообщений)…")
 
@@ -1285,7 +1284,100 @@ async def cmd_export(message: Message):
         f"└ Сформировано: <b>{fmt(datetime.now(MSK))}</b>\n\n"
         f"📎 Полная переписка во вложении"
     )
-    await send_transcript_document(message.chat.id, chat_title, entries, owner_id_for_chat, caption)
+    await send_transcript_document(message.chat.id, chat_title, entries, message.from_user.id, caption)
+
+
+# ─── /info — ключевые моменты по ключевым словам ──────────────
+INFO_PATTERNS = [
+    ("🎂 Возраст", [
+        r'мне\s+(\d{1,3})\s*(?:лет|года|год)\b',
+        r'исполнилось\s+(\d{1,3})\s*(?:лет|года|год)?',
+    ]),
+    ("🎉 Дата рождения", [
+        r'(?:день\s*рождения|др)\D{0,15}(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
+        r'родил[а]?сь?\D{0,15}(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
+    ]),
+    ("💘 Симпатия / любовь", [
+        r'(?:люблю|обожаю|нравится|влюблен[а]?|втюрилась|втюрился|втрескал[а]?сь)\s+([^\n.!?,]{1,60})',
+    ]),
+    ("🎯 Хочет / мечтает", [
+        r'(?:хочу|мечтаю|надеюсь|планирую)\s+([^\n.!?,]{1,60})',
+    ]),
+    ("🚫 Не любит / бесит", [
+        r'(?:ненавиж[у]|бесит|терпеть не могу|не люблю)\s+([^\n.!?,]{1,60})',
+    ]),
+    ("📍 Место / город", [
+        r'(?:я\s+из|живу\s+в)\s+([^\n.,!?]{1,40})',
+    ]),
+    ("💼 Работа / учёба", [
+        r'(?:работаю|учусь)\s+([^\n.,!?]{1,50})',
+    ]),
+]
+
+
+def scan_info(entries: list[tuple[int, dict]]) -> dict[str, list[tuple[str, str, str]]]:
+    found: dict[str, list[tuple[str, str, str]]] = {label: [] for label, _ in INFO_PATTERNS}
+    for msg_id, data in entries:
+        text = data.get("text", "")
+        if not text:
+            continue
+        time_str = fmt(data["sent_at"])
+        sender = data.get("sender_name", "?")
+        for label, patterns in INFO_PATTERNS:
+            for pattern in patterns:
+                for m in re.finditer(pattern, text, re.IGNORECASE):
+                    snippet = (m.group(1) if m.groups() else m.group(0)).strip()
+                    if snippet:
+                        found[label].append((time_str, sender, snippet))
+    return found
+
+
+@dp.message(Command("info"))
+async def cmd_info(message: Message):
+    text = message.text or ""
+    match = re.search(r'@(\w+)', text)
+    if not match:
+        await message.answer(
+            "📋 <code>/info @username</code>\n"
+            "Поищет в переписке возраст, дату рождения, симпатии, желания и т.п. по ключевым словам.",
+            parse_mode="HTML"
+        )
+        return
+    username = match.group(1).lower()
+
+    entries, chat_title = find_own_conversation(message.from_user.id, username)
+    if not entries:
+        await message.answer(f"📭 Нет сообщений с @{username} в кеше.")
+        return
+
+    found = scan_info(entries)
+    lines = [f"🔎 <b>Ключевые моменты — {html_mod.escape(chat_title)}</b>"]
+    total = 0
+    for label, items in found.items():
+        if not items:
+            continue
+        lines.append(f"\n<b>{label}</b>")
+        for time_str, sender, snippet in items[:8]:
+            total += 1
+            lines.append(f"· {time_str} — <b>{html_mod.escape(sender)}</b>: «{html_mod.escape(snippet)}»")
+
+    if total == 0:
+        await message.answer(f"🤷 По @{username} ничего не нашлось — совпадений по ключевым словам нет.")
+        return
+
+    lines.append(f"\n{WARNING} Это просто поиск по ключевым словам в тексте, не реальный анализ — проверяйте сами.")
+
+    chunks = []
+    current = ""
+    for line in lines:
+        if len(current) + len(line) + 1 > 4000:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current)
+    for chunk in chunks:
+        await message.answer(chunk, parse_mode="HTML")
 
 
 @dp.message(Command("exclude"))
@@ -1388,7 +1480,10 @@ async def cmd_start(message: Message):
         await message.answer(
             "👁 Бот активен.\n\n"
             "Подключи в <b>Настройки → Telegram Business → Чат-боты</b> "
-            "и я буду пересылать тебе удалённые сообщения.",
+            "и я буду пересылать тебе удалённые и изменённые сообщения.\n\n"
+            "<b>Команды:</b>\n"
+            "/export @user — сохранить переписку с человеком в HTML-файл на память\n"
+            "/info @user — найти в переписке ключевые моменты (возраст, симпатии, желания и т.п.)",
             parse_mode="HTML"
         )
 
