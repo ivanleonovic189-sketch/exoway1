@@ -1922,11 +1922,23 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 
 def menu_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Экспорт переписки", callback_data="menu_export")],
-        [InlineKeyboardButton(text="🔎 Инфо по человеку", callback_data="menu_info")],
-        [InlineKeyboardButton(text="⏰ Поставить напоминание", callback_data="menu_remind")],
+        [InlineKeyboardButton(
+            text="Экспорт переписки", callback_data="menu_export",
+            icon_custom_emoji_id=EMOJI_EXPORT_DONE_ID,
+        )],
+        [InlineKeyboardButton(
+            text="Инфо по человеку", callback_data="menu_info",
+            icon_custom_emoji_id=EMOJI_KEY_MOMENTS_ID,
+        )],
+        [InlineKeyboardButton(
+            text="Поставить напоминание", callback_data="menu_remind",
+            icon_custom_emoji_id=EMOJI_EXPORT_PROGRESS_ID,
+        )],
         [InlineKeyboardButton(text="📋 Мои напоминания", callback_data="menu_reminders")],
-        [InlineKeyboardButton(text="🗑 Отменить напоминание", callback_data="menu_cancel")],
+        [InlineKeyboardButton(
+            text="Отменить напоминание", callback_data="menu_cancel",
+            icon_custom_emoji_id=EMOJI_TRASH_ID,
+        )],
     ])
 
 
@@ -2501,6 +2513,7 @@ async def main():
 
     allowed = [
         "message",
+        "callback_query",
         "business_message",
         "edited_business_message",
         "deleted_business_messages",
