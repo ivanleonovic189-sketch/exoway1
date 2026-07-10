@@ -417,6 +417,26 @@ load_reminders()
 
 DIGEST_HOUR_MSK = int(os.getenv("DIGEST_HOUR_MSK", "21"))  # во сколько слать ежедневную сводку, по МСК
 
+DIGEST_DISABLED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digest_disabled.json")
+digest_disabled: set[int] = set()
+
+
+def load_digest_disabled():
+    global digest_disabled
+    try:
+        with open(DIGEST_DISABLED_FILE, "r", encoding="utf-8") as f:
+            digest_disabled = set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        digest_disabled = set()
+
+
+def save_digest_disabled():
+    with open(DIGEST_DISABLED_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(digest_disabled), f)
+
+
+load_digest_disabled()
+
 
 def fmt(dt: datetime) -> str:
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
@@ -448,7 +468,7 @@ def parse_remind_time(text: str, now: datetime) -> tuple[datetime | None, str]:
             delta = timedelta(days=amount)
         return now + delta, rest
 
-    m = re.match(r'^(сегодня|завтра|послезавтра)\s+в\s+(\d{1,2})[:.](\d{2})\s+(.*)$', text, re.IGNORECASE)
+    m = re.match(r'^(сегодня|завтра|послезавтра)\s+(?:в\s+)?(\d{1,2})[:.](\d{2})\s+(.*)$', text, re.IGNORECASE)
     if m:
         day_word, hh, mm, rest = m.group(1).lower(), int(m.group(2)), int(m.group(3)), m.group(4)
         offset = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[day_word]
@@ -461,7 +481,7 @@ def parse_remind_time(text: str, now: datetime) -> tuple[datetime | None, str]:
 
     m = re.match(
         r'^в\s+(понедельник|вторник|среду|четверг|пятницу|субботу|воскресенье)'
-        r'(?:\s+в\s+(\d{1,2})[:.](\d{2}))?\s+(.*)$',
+        r'(?:\s+(?:в\s+)?(\d{1,2})[:.](\d{2}))?\s+(.*)$',
         text, re.IGNORECASE
     )
     if m:
@@ -480,6 +500,18 @@ def parse_remind_time(text: str, now: datetime) -> tuple[datetime | None, str]:
         return due, rest
 
     m = re.match(r'^в\s+(\d{1,2})[:.](\d{2})\s+(.*)$', text, re.IGNORECASE)
+    if m:
+        hh, mm, rest = int(m.group(1)), int(m.group(2)), m.group(3)
+        try:
+            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        except ValueError:
+            return None, text
+        if due <= now:
+            due += timedelta(days=1)
+        return due, rest
+
+    # голое "HH:MM текст" без предлога "в"
+    m = re.match(r'^(\d{1,2})[:.](\d{2})\s+(.*)$', text)
     if m:
         hh, mm, rest = int(m.group(1)), int(m.group(2)), m.group(3)
         try:
@@ -1547,17 +1579,11 @@ async def cmd_remind(message: Message):
 
 
 async def run_reminders(message: Message, user_id: int):
-    mine = [r for r in reminders if r["user_id"] == user_id]
-    if not mine:
+    kb = reminders_keyboard(user_id)
+    if not kb:
         await message.answer("📭 Нет активных напоминаний.")
         return
-    mine.sort(key=lambda r: r["due_at"])
-    lines = ["⏰ <b>Твои напоминания (МСК):</b>\n"]
-    for r in mine:
-        due = datetime.fromisoformat(r["due_at"])
-        lines.append(f"#{r['id']} · {fmt(due)} — {html_mod.escape(r['text'])}")
-    lines.append("\nОтменить: <code>/cancelreminder ID</code>")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer(REMINDERS_LIST_TEXT, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(Command("reminders"))
@@ -1660,6 +1686,8 @@ async def digest_loop():
         today_str = now.strftime("%Y-%m-%d")
         for conn_id, owner in list(connections.items()):
             owner_id = owner["user_id"]
+            if owner_id in digest_disabled:
+                continue
             if sent_dates.get(owner_id) == today_str:
                 continue
             await send_daily_digest(conn_id, owner_id, now)
@@ -1920,7 +1948,8 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def menu_inline_keyboard() -> InlineKeyboardMarkup:
+def menu_inline_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    digest_label = "🔔 Включить дневную сводку" if user_id in digest_disabled else "🔕 Отключить дневную сводку"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="Экспорт переписки", callback_data="menu_export",
@@ -1935,11 +1964,26 @@ def menu_inline_keyboard() -> InlineKeyboardMarkup:
             icon_custom_emoji_id=EMOJI_EXPORT_PROGRESS_ID,
         )],
         [InlineKeyboardButton(text="📋 Мои напоминания", callback_data="menu_reminders")],
-        [InlineKeyboardButton(
-            text="Отменить напоминание", callback_data="menu_cancel",
-            icon_custom_emoji_id=EMOJI_TRASH_ID,
-        )],
+        [InlineKeyboardButton(text=digest_label, callback_data="menu_toggle_digest")],
     ])
+
+
+def reminders_keyboard(user_id: int) -> InlineKeyboardMarkup | None:
+    mine = sorted((r for r in reminders if r["user_id"] == user_id), key=lambda r: r["due_at"])
+    if not mine:
+        return None
+    rows = []
+    for r in mine:
+        due = datetime.fromisoformat(r["due_at"])
+        preview = r["text"][:25] + ("…" if len(r["text"]) > 25 else "")
+        label = f"🗑 {due.strftime('%d.%m %H:%M')} — {preview}"
+        rows.append([InlineKeyboardButton(
+            text=label, callback_data=f"cancelrem_{r['id']}", icon_custom_emoji_id=EMOJI_TRASH_ID,
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+REMINDERS_LIST_TEXT = "⏰ <b>Твои напоминания (МСК):</b>\nНажми на напоминание, чтобы отменить его."
 
 
 @dp.message(F.text == MENU_BUTTON_TEXT)
@@ -1948,7 +1992,7 @@ async def on_menu_button(message: Message):
     await message.answer(
         f"{KEY_MOMENTS} <b>Что сделать?</b>\nВыбери ниже — набирать команды не нужно.",
         parse_mode="HTML",
-        reply_markup=menu_inline_keyboard(),
+        reply_markup=menu_inline_keyboard(message.from_user.id),
     )
 
 
@@ -1956,6 +2000,7 @@ async def on_menu_button(message: Message):
 async def on_menu_callback(callback: CallbackQuery):
     uid = callback.from_user.id
     action = callback.data
+    toast = ""
 
     if action == "menu_export":
         pending_action[uid] = "export"
@@ -1984,13 +2029,47 @@ async def on_menu_callback(callback: CallbackQuery):
     elif action == "menu_reminders":
         pending_action.pop(uid, None)
         await run_reminders(callback.message, uid)
-    elif action == "menu_cancel":
-        pending_action[uid] = "cancel"
-        await callback.message.answer(
-            f"{WARNING} Напиши ID напоминания для отмены (посмотреть — «📋 Мои напоминания»)",
-            parse_mode="HTML",
-        )
-    await callback.answer()
+    elif action == "menu_toggle_digest":
+        if uid in digest_disabled:
+            digest_disabled.discard(uid)
+            toast = "🔔 Дневная сводка включена"
+        else:
+            digest_disabled.add(uid)
+            toast = "🔕 Дневная сводка отключена"
+        save_digest_disabled()
+        try:
+            await callback.message.edit_reply_markup(reply_markup=menu_inline_keyboard(uid))
+        except Exception:
+            pass
+
+    await callback.answer(toast)
+
+
+@dp.callback_query(F.data.startswith("cancelrem_"))
+async def on_cancel_reminder_button(callback: CallbackQuery):
+    uid = callback.from_user.id
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+
+    before = len(reminders)
+    reminders[:] = [r for r in reminders if not (r["id"] == rid and r["user_id"] == uid)]
+    if len(reminders) == before:
+        await callback.answer("⚠️ Не найдено")
+        return
+    save_reminders()
+
+    kb = reminders_keyboard(uid)
+    try:
+        if kb:
+            await callback.message.edit_text(REMINDERS_LIST_TEXT, parse_mode="HTML", reply_markup=kb)
+        else:
+            await callback.message.edit_text("📭 Нет активных напоминаний.")
+    except Exception:
+        pass
+    await callback.answer("✅ Отменено")
 
 
 @dp.message((F.chat.type == "private") & F.text & ~F.text.startswith("/"))
@@ -2010,8 +2089,6 @@ async def on_pending_input(message: Message):
         await run_info(message, arg)
     elif action == "remind":
         await run_remind(message, text)
-    elif action == "cancel":
-        await run_cancel_reminder(message, text, uid)
 
 
 @dp.message(Command("start"))
