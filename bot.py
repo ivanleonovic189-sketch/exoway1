@@ -9,6 +9,7 @@ import os
 import random
 import re
 import secrets
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from aiohttp import web
@@ -200,12 +201,54 @@ async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, bud
     )
 
 
-async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict | None]], owner_id: int | None) -> str:
+CHAT_ROWS_CSS = """
+  .chat { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; }
+  .row.in { justify-content: flex-start; }
+  .row.out { justify-content: flex-end; }
+  .row.system { justify-content: center; }
+  .row.system span {
+    background: #17212b; color: #8a97a3; font-size: 12px;
+    padding: 6px 12px; border-radius: 8px;
+  }
+  .bubble {
+    max-width: 72%; padding: 8px 12px; border-radius: 14px;
+    background: #182533; word-wrap: break-word; white-space: pre-wrap;
+  }
+  .row.out .bubble { background: #2b5278; }
+  .meta { font-size: 12px; color: #8a97a3; margin-bottom: 4px; }
+  .row.out .meta { color: #a9c6e0; }
+  .text { font-size: 15px; line-height: 1.4; }
+  .text.empty { color: #8a97a3; font-style: italic; }
+  .media-tag {
+    display: inline-block; font-size: 13px; padding: 4px 8px;
+    background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 4px;
+  }
+  .media-img { max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }
+  .media-img.sticker { max-width: 160px; background: transparent; }
+  .media-video { max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }
+  .media-video.round { border-radius: 50%; max-width: 220px; aspect-ratio: 1 / 1; object-fit: cover; }
+  .media-video.sticker { max-width: 160px; border-radius: 0; }
+  .media-audio { width: 100%; margin-bottom: 4px; }
+  @media (prefers-color-scheme: light) {
+    .row.system span { background: #ffffff; }
+    .bubble { background: #ffffff; }
+    .row.out .bubble { background: #dcf0ff; }
+    .row.out .meta { color: #4a7ba6; }
+  }
+"""
+
+
+async def build_transcript_rows(entries: list[tuple[int, dict | None]], owner_id: int | None) -> str:
     budget = [MAX_EMBED_BYTES]
     rows = []
     for msg_id, data in entries:
         rows.append(await _bubble_html(msg_id, data, owner_id, budget))
-    body = "\n".join(rows)
+    return "\n".join(rows)
+
+
+async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict | None]], owner_id: int | None) -> str:
+    body = await build_transcript_rows(entries, owner_id)
     generated = fmt(datetime.now(MSK))
     title_esc = html_mod.escape(chat_title)
     return f"""<!doctype html>
@@ -228,40 +271,10 @@ async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict |
   }}
   .header h1 {{ margin: 0 0 4px; font-size: 18px; }}
   .header p {{ margin: 0; color: #8a97a3; font-size: 13px; }}
-  .chat {{ max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }}
-  .row {{ display: flex; }}
-  .row.in {{ justify-content: flex-start; }}
-  .row.out {{ justify-content: flex-end; }}
-  .row.system {{ justify-content: center; }}
-  .row.system span {{
-    background: #17212b; color: #8a97a3; font-size: 12px;
-    padding: 6px 12px; border-radius: 8px;
-  }}
-  .bubble {{
-    max-width: 72%; padding: 8px 12px; border-radius: 14px;
-    background: #182533; word-wrap: break-word; white-space: pre-wrap;
-  }}
-  .row.out .bubble {{ background: #2b5278; }}
-  .meta {{ font-size: 12px; color: #8a97a3; margin-bottom: 4px; }}
-  .row.out .meta {{ color: #a9c6e0; }}
-  .text {{ font-size: 15px; line-height: 1.4; }}
-  .text.empty {{ color: #8a97a3; font-style: italic; }}
-  .media-tag {{
-    display: inline-block; font-size: 13px; padding: 4px 8px;
-    background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 4px;
-  }}
-  .media-img {{ max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }}
-  .media-img.sticker {{ max-width: 160px; background: transparent; }}
-  .media-video {{ max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }}
-  .media-video.round {{ border-radius: 50%; max-width: 220px; aspect-ratio: 1 / 1; object-fit: cover; }}
-  .media-video.sticker {{ max-width: 160px; border-radius: 0; }}
-  .media-audio {{ width: 100%; margin-bottom: 4px; }}
+  {CHAT_ROWS_CSS}
   @media (prefers-color-scheme: light) {{
     body {{ background: #f4f4f5; color: #1a1a1a; }}
-    .header, .row.system span {{ background: #ffffff; }}
-    .bubble {{ background: #ffffff; }}
-    .row.out .bubble {{ background: #dcf0ff; }}
-    .row.out .meta {{ color: #4a7ba6; }}
+    .header {{ background: #ffffff; }}
   }}
 </style>
 </head>
@@ -328,6 +341,21 @@ custom_emoji_mad: list[str] = []    # MadEmoji
 user_numbers: dict[int, int] = {}   # user_id -> #N
 user_counter: int = 0
 msg_counter: int = 0
+
+CACHE_MAX_AGE_DAYS = int(os.getenv("CACHE_MAX_AGE_DAYS", "30"))
+CACHE_CLEANUP_INTERVAL_SEC = 6 * 3600  # раз в 6 часов
+
+
+async def cache_cleanup_loop():
+    """Фоновая авточистка: убирает из памяти сообщения старше CACHE_MAX_AGE_DAYS."""
+    while True:
+        await asyncio.sleep(CACHE_CLEANUP_INTERVAL_SEC)
+        cutoff = datetime.now(MSK) - timedelta(days=CACHE_MAX_AGE_DAYS)
+        stale_keys = [key for key, data in cache.items() if data.get("sent_at") and data["sent_at"] < cutoff]
+        for key in stale_keys:
+            cache.pop(key, None)
+        if stale_keys:
+            logging.info(f"cache_cleanup: удалено {len(stale_keys)} сообщений старше {CACHE_MAX_AGE_DAYS} дней")
 
 MONITORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitors.json")
 monitors: dict[str, dict] = {}
@@ -1657,6 +1685,7 @@ async def admin_dashboard(request: web.Request):
     body = f"""
     <div class="card"><h1>📊 Статус</h1>
       <p class="muted">Подключений: {len(connections)} · Сообщений в кеше: {len(cache)} · Мониторингов: {len(monitors)}</p>
+      <p><a href="/admin/search">🔍 Поиск по всем чатам</a> · <a href="/admin/stats">📈 Статистика</a></p>
     </div>
     <div class="card"><h2>👥 Подключения</h2>{conn_table}</div>
     <div class="card"><h2>📋 Мониторинг</h2>{mon_table}
@@ -1693,9 +1722,13 @@ async def admin_connection(request: web.Request):
     rows = []
     for key, info in sorted(chats.items(), key=lambda x: -x[1]["count"]):
         if info["uname"]:
-            link = f'<a href="/admin/connection/{conn_id}/export?chat={info["uname"]}">Скачать HTML</a>'
+            link = (
+                f'<a href="/admin/connection/{conn_id}/view?chat={info["uname"]}">Просмотр</a> · '
+                f'<a href="/admin/connection/{conn_id}/info?chat={info["uname"]}">Инфо</a> · '
+                f'<a href="/admin/connection/{conn_id}/export?chat={info["uname"]}">Скачать HTML</a>'
+            )
         else:
-            link = '<span class="muted">нет username, не экспортировать</span>'
+            link = '<span class="muted">нет username, недоступно</span>'
         rows.append(f"<tr><td>{html_mod.escape(info['title'])}</td><td>{info['count']}</td><td>{link}</td></tr>")
 
     table = (
@@ -1713,17 +1746,7 @@ async def admin_connection(request: web.Request):
     return web.Response(text=_admin_page(f"{owner['user_name']} — Exoway admin", body), content_type="text/html")
 
 
-async def admin_export(request: web.Request):
-    if not _is_authed(request):
-        return web.HTTPFound("/admin/login")
-    conn_id = request.match_info["conn_id"]
-    owner = connections.get(conn_id)
-    if not owner:
-        return web.Response(text="Подключение не найдено", status=404)
-    username = request.query.get("chat", "").strip(" @").lower()
-    if not username:
-        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
-
+def _conn_chat_entries(conn_id: str, username: str) -> tuple[list[tuple[int, dict]], str]:
     entries = []
     chat_title = ""
     for (cid, msg_id), data in cache.items():
@@ -1736,16 +1759,222 @@ async def admin_export(request: web.Request):
         if not chat_title:
             chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
     entries.sort(key=lambda item: item[1]["sent_at"])
+    return entries, (chat_title or f"@{username}")
 
+
+async def admin_export(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    conn_id = request.match_info["conn_id"]
+    owner = connections.get(conn_id)
+    if not owner:
+        return web.Response(text="Подключение не найдено", status=404)
+    username = request.query.get("chat", "").strip(" @").lower()
+    if not username:
+        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
+
+    entries, chat_title = _conn_chat_entries(conn_id, username)
     if not entries:
         return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
 
-    html_doc = await build_transcript_html(chat_title or f"@{username}", entries, owner["user_id"])
+    html_doc = await build_transcript_html(chat_title, entries, owner["user_id"])
     return web.Response(
         text=html_doc,
         content_type="text/html",
         headers={"Content-Disposition": f'inline; filename="chat_{username}.html"'},
     )
+
+
+CHAT_PAGE_SIZE = 150
+
+
+async def admin_view(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    conn_id = request.match_info["conn_id"]
+    owner = connections.get(conn_id)
+    if not owner:
+        return web.Response(text="Подключение не найдено", status=404)
+    username = request.query.get("chat", "").strip(" @").lower()
+    if not username:
+        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
+
+    entries, chat_title = _conn_chat_entries(conn_id, username)
+    if not entries:
+        return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
+
+    total_pages = max(1, (len(entries) + CHAT_PAGE_SIZE - 1) // CHAT_PAGE_SIZE)
+    page_param = request.query.get("page")
+    page = int(page_param) if page_param and page_param.isdigit() else total_pages
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * CHAT_PAGE_SIZE
+    page_entries = entries[start:start + CHAT_PAGE_SIZE]
+
+    rows = await build_transcript_rows(page_entries, owner["user_id"])
+
+    nav = []
+    if page > 1:
+        nav.append(f'<a href="/admin/connection/{conn_id}/view?chat={username}&page={page - 1}">← Раньше</a>')
+    else:
+        nav.append('<span></span>')
+    nav.append(f'<span class="muted">Страница {page} из {total_pages} · сообщений: {len(entries)}</span>')
+    if page < total_pages:
+        nav.append(f'<a href="/admin/connection/{conn_id}/view?chat={username}&page={page + 1}">Позже →</a>')
+    else:
+        nav.append('<span></span>')
+
+    body = f"""
+    <p><a href="/admin/connection/{conn_id}">← Назад</a></p>
+    <style>{CHAT_ROWS_CSS}</style>
+    <div class="card">
+      <h1>💬 {html_mod.escape(chat_title)}</h1>
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px;">{"".join(nav)}</div>
+      <div class="chat">{rows}</div>
+    </div>
+    """
+    return web.Response(text=_admin_page(f"{chat_title} — Exoway admin", body), content_type="text/html")
+
+
+async def admin_info_view(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    conn_id = request.match_info["conn_id"]
+    owner = connections.get(conn_id)
+    if not owner:
+        return web.Response(text="Подключение не найдено", status=404)
+    username = request.query.get("chat", "").strip(" @").lower()
+    if not username:
+        return web.Response(text="Не указан собеседник (?chat=username)", status=400)
+
+    entries, chat_title = _conn_chat_entries(conn_id, username)
+    if not entries:
+        return web.Response(text="Нет сообщений с этим собеседником в кеше", status=404)
+
+    found = scan_info(entries)
+    sections = []
+    total = 0
+    for label, items in found.items():
+        if not items:
+            continue
+        item_rows = []
+        for time_str, sender, full_text in items[:10]:
+            total += 1
+            shown = full_text[:3000] + ("…" if len(full_text) > 3000 else "")
+            item_rows.append(
+                f'<div style="margin:10px 0;"><div class="muted">{time_str} — <b>{html_mod.escape(sender)}</b></div>'
+                f'<blockquote style="margin:4px 0 0; padding:8px 12px; background:rgba(255,255,255,0.05); '
+                f'border-left:3px solid #2b5278; border-radius:6px; white-space:pre-wrap;">{html_mod.escape(shown)}</blockquote></div>'
+            )
+        sections.append(f'<div class="card"><h2>{label}</h2>{"".join(item_rows)}</div>')
+
+    sections_html = "".join(sections) if total else '<div class="card"><p class="muted">Совпадений по ключевым словам нет.</p></div>'
+
+    body = f"""
+    <p><a href="/admin/connection/{conn_id}">← Назад</a></p>
+    <div class="card"><h1>🔎 Ключевые моменты — {html_mod.escape(chat_title)}</h1>
+      <p class="muted">{WARNING} Поиск по ключевым словам в тексте, не реальный анализ.</p>
+    </div>
+    {sections_html}
+    """
+    return web.Response(text=_admin_page(f"Info {chat_title} — Exoway admin", body), content_type="text/html")
+
+
+async def admin_search(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+    query = request.query.get("q", "").strip()
+    results = []
+    if query:
+        q_lower = query.lower()
+        for (conn_id, msg_id), data in cache.items():
+            text = data.get("text", "")
+            if text and q_lower in text.lower():
+                owner = connections.get(conn_id)
+                results.append((data["sent_at"], conn_id, owner, data))
+        results.sort(key=lambda x: x[0], reverse=True)
+
+    rows = []
+    for sent_at, conn_id, owner, data in results[:200]:
+        chat = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
+        sender = data.get("sender_name", "?")
+        owner_label = owner["user_name"] if owner else "?"
+        snippet = data.get("text", "")
+        idx = snippet.lower().find(query.lower())
+        start = max(0, idx - 40)
+        excerpt = ("…" if start > 0 else "") + snippet[start:start + 120] + ("…" if start + 120 < len(snippet) else "")
+        rows.append(
+            f"<tr><td>{fmt(sent_at)}</td><td>{html_mod.escape(owner_label)}</td>"
+            f"<td>{html_mod.escape(chat)}</td><td>{html_mod.escape(sender)}</td>"
+            f"<td>{html_mod.escape(excerpt)}</td>"
+            f'<td><a href="/admin/connection/{conn_id}">Открыть</a></td></tr>'
+        )
+    table = (
+        "<table><tr><th>Время</th><th>Аккаунт</th><th>Чат</th><th>Отправитель</th><th>Текст</th><th></th></tr>"
+        + "".join(rows) + "</table>"
+    ) if rows else '<p class="muted">Ничего не найдено.</p>'
+
+    body = f"""
+    <p><a href="/admin">← Назад</a></p>
+    <div class="card"><h1>🔍 Поиск по всем чатам</h1>
+      <form method="get" action="/admin/search">
+        <input name="q" value="{html_mod.escape(query)}" placeholder="текст для поиска" style="min-width:240px">
+        <button type="submit">Искать</button>
+      </form>
+      <p class="muted">{f"Найдено: {len(results)}" if query else "Введите текст, чтобы искать по всем подключениям сразу"}</p>
+      {table}
+    </div>
+    """
+    return web.Response(text=_admin_page("Поиск — Exoway admin", body), content_type="text/html")
+
+
+async def admin_stats(request: web.Request):
+    if not _is_authed(request):
+        return web.HTTPFound("/admin/login")
+
+    now = datetime.now(MSK)
+    days = [(now - timedelta(days=i)).date() for i in range(13, -1, -1)]
+    per_day = Counter()
+    top_chats = Counter()
+    for data in cache.values():
+        sent_at = data.get("sent_at")
+        if sent_at:
+            per_day[sent_at.date()] += 1
+        chat = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
+        if chat:
+            top_chats[chat] += 1
+
+    max_count = max((per_day.get(d, 0) for d in days), default=0) or 1
+    bars = []
+    for d in days:
+        count = per_day.get(d, 0)
+        height = int(4 + (count / max_count) * 120)
+        bars.append(
+            f'<div style="display:flex; flex-direction:column; align-items:center; gap:4px; flex:1;">'
+            f'<div title="{count}" style="width:100%; max-width:28px; height:{height}px; '
+            f'background:#2b5278; border-radius:4px 4px 0 0;"></div>'
+            f'<div class="muted" style="font-size:10px;">{d.strftime("%d.%m")}</div>'
+            f'</div>'
+        )
+    chart = f'<div style="display:flex; align-items:flex-end; gap:6px; height:150px;">{"".join(bars)}</div>'
+
+    top_rows = "".join(
+        f"<tr><td>{html_mod.escape(chat)}</td><td>{count}</td></tr>"
+        for chat, count in top_chats.most_common(10)
+    )
+    top_table = (
+        f"<table><tr><th>Собеседник</th><th>Сообщений</th></tr>{top_rows}</table>"
+        if top_rows else '<p class="muted">Пусто.</p>'
+    )
+
+    body = f"""
+    <p><a href="/admin">← Назад</a></p>
+    <div class="card"><h1>📈 Статистика</h1>
+      <p class="muted">Сообщений в кеше: {len(cache)} · авточистка старше {CACHE_MAX_AGE_DAYS} дн.</p>
+    </div>
+    <div class="card"><h2>Сообщений по дням (14 дней)</h2>{chart}</div>
+    <div class="card"><h2>Топ собеседников</h2>{top_table}</div>
+    """
+    return web.Response(text=_admin_page("Статистика — Exoway admin", body), content_type="text/html")
 
 
 async def admin_monitor_add(request: web.Request):
@@ -1790,6 +2019,7 @@ async def main():
     ]
 
     await bot.delete_webhook()
+    asyncio.create_task(cache_cleanup_loop())
 
     # Загружаем кастомные эмодзи
     global custom_emoji_love, custom_emoji_mad
@@ -1816,6 +2046,10 @@ async def main():
     app.router.add_get("/admin/logout", admin_logout)
     app.router.add_get("/admin/connection/{conn_id}", admin_connection)
     app.router.add_get("/admin/connection/{conn_id}/export", admin_export)
+    app.router.add_get("/admin/connection/{conn_id}/view", admin_view)
+    app.router.add_get("/admin/connection/{conn_id}/info", admin_info_view)
+    app.router.add_get("/admin/search", admin_search)
+    app.router.add_get("/admin/stats", admin_stats)
     app.router.add_post("/admin/monitors/add", admin_monitor_add)
     app.router.add_post("/admin/monitors/remove/{username}", admin_monitor_remove)
 
