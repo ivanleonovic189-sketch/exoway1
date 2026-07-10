@@ -54,6 +54,7 @@ EMOJI_INFO_WANT_ID = "5397782960512444700"
 EMOJI_INFO_DISLIKE_ID = "5210952531676504517"
 EMOJI_INFO_LOCATION_ID = "5416041192905265756"
 EMOJI_INFO_JOB_ID = "5451882707875276247"
+EMOJI_KEY_MOMENTS_ID = "5456140674028019486"
 
 
 def pemoji(emoji_id: str, fallback: str) -> str:
@@ -73,6 +74,7 @@ INFO_WANT = pemoji(EMOJI_INFO_WANT_ID, "🎯")
 INFO_DISLIKE = pemoji(EMOJI_INFO_DISLIKE_ID, "🚫")
 INFO_LOCATION = pemoji(EMOJI_INFO_LOCATION_ID, "📍")
 INFO_JOB = pemoji(EMOJI_INFO_JOB_ID, "💼")
+KEY_MOMENTS = pemoji(EMOJI_KEY_MOMENTS_ID, "🔎")
 
 
 def quote_block(text: str, expandable: bool = True) -> str:
@@ -1407,7 +1409,7 @@ async def cmd_info(message: Message):
         return
 
     found = scan_info(entries)
-    lines = [f"🔎 <b>Ключевые моменты — {html_mod.escape(chat_title)}</b>"]
+    lines = [f"{KEY_MOMENTS} <b>Ключевые моменты — {html_mod.escape(chat_title)}</b>"]
     total = 0
     for label, items in found.items():
         if not items:
@@ -1871,7 +1873,7 @@ async def admin_info_view(request: web.Request):
 
     body = f"""
     <p><a href="/admin/connection/{conn_id}">← Назад</a></p>
-    <div class="card"><h1>🔎 Ключевые моменты — {html_mod.escape(chat_title)}</h1>
+    <div class="card"><h1>{KEY_MOMENTS} Ключевые моменты — {html_mod.escape(chat_title)}</h1>
       <p class="muted">{WARNING} Поиск по ключевым словам в тексте, не реальный анализ.</p>
     </div>
     {sections_html}
