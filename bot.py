@@ -62,9 +62,9 @@ def quote_block(text: str, expandable: bool = True) -> str:
     return f'\n\n<blockquote{attr}>{escaped}</blockquote>'
 
 
-# ─── Массовое удаление → экспорт переписки в HTML ─────────────
-BULK_DELETE_THRESHOLD = 3   # от скольки удалённых сообщений разом считаем это "снесли всю переписку"
-MAX_EMBED_PHOTOS = 30       # сколько фото максимум вшивать в файл как base64
+# ─── Массовое удаление / экспорт переписки в HTML ─────────────
+BULK_DELETE_THRESHOLD = 3                    # от скольки удалённых сообщений разом считаем это "снесли всю переписку"
+MAX_EMBED_BYTES = 18 * 1024 * 1024           # общий бюджет на вшиваемые медиа в одном файле (сырых байт, до base64)
 
 MEDIA_LABELS = {
     "photo": "📷 Фото",
@@ -77,17 +77,26 @@ MEDIA_LABELS = {
 }
 
 
-async def _download_photo_b64(file_id: str) -> str | None:
+async def _download_b64_budgeted(file_id: str, budget: list[int]) -> str | None:
+    """Скачивает файл и кодирует в base64, если укладывается в оставшийся бюджет байт."""
+    if budget[0] <= 0:
+        return None
     try:
         file_info = await bot.get_file(file_id)
+        if file_info.file_size and file_info.file_size > budget[0]:
+            return None
         buf = await bot.download_file(file_info.file_path)
-        return base64.b64encode(buf.read()).decode()
+        raw = buf.read()
+        if len(raw) > budget[0]:
+            return None
+        budget[0] -= len(raw)
+        return base64.b64encode(raw).decode()
     except Exception as e:
-        logging.warning(f"Не удалось скачать фото {file_id}: {e}")
+        logging.warning(f"Не удалось скачать медиа {file_id}: {e}")
         return None
 
 
-async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, photo_budget: list[int]) -> str:
+async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, budget: list[int]) -> str:
     if not data:
         return f'<div class="row system"><span>Сообщение #{msg_id} — нет данных в кеше</span></div>'
 
@@ -99,19 +108,63 @@ async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, pho
     text = html_mod.escape(data.get("text", ""))
 
     media_html = ""
-    for field, label in MEDIA_LABELS.items():
-        if not data.get(field):
-            continue
-        if field == "photo" and photo_budget[0] > 0:
-            photo_budget[0] -= 1
-            b64 = await _download_photo_b64(data["photo"])
+    if data.get("photo"):
+        b64 = await _download_b64_budgeted(data["photo"], budget)
+        media_html = (
+            f'<img class="media-img" src="data:image/jpeg;base64,{b64}" alt="photo">'
+            if b64 else '<div class="media-tag">📷 Фото</div>'
+        )
+    elif data.get("video"):
+        b64 = await _download_b64_budgeted(data["video"], budget)
+        media_html = (
+            f'<video class="media-video" controls src="data:video/mp4;base64,{b64}"></video>'
+            if b64 else '<div class="media-tag">🎥 Видео</div>'
+        )
+    elif data.get("video_note"):
+        b64 = await _download_b64_budgeted(data["video_note"], budget)
+        media_html = (
+            f'<video class="media-video round" controls src="data:video/mp4;base64,{b64}"></video>'
+            if b64 else '<div class="media-tag">⚫ Кружочек</div>'
+        )
+    elif data.get("voice"):
+        b64 = await _download_b64_budgeted(data["voice"], budget)
+        media_html = (
+            f'<audio class="media-audio" controls src="data:audio/ogg;base64,{b64}"></audio>'
+            if b64 else '<div class="media-tag">🎤 Голосовое</div>'
+        )
+    elif data.get("sticker"):
+        if data.get("sticker_is_animated"):
+            # .tgs (Lottie) — без JS-плеера не отрисовать, показываем статичный превью-thumbnail
+            thumb = data.get("sticker_thumb")
+            b64 = await _download_b64_budgeted(thumb, budget) if thumb else None
             if b64:
-                media_html = f'<img class="photo" src="data:image/jpeg;base64,{b64}" alt="photo">'
+                media_html = (
+                    f'<img class="media-img sticker" src="data:image/webp;base64,{b64}" alt="sticker">'
+                    f'<div class="media-tag">✨ Анимированный стикер</div>'
+                )
             else:
-                media_html = f'<div class="media-tag">{label}</div>'
+                media_html = '<div class="media-tag">✨ Анимированный стикер</div>'
+        elif data.get("sticker_is_video"):
+            b64 = await _download_b64_budgeted(data["sticker"], budget)
+            media_html = (
+                f'<video class="media-video sticker" controls loop muted autoplay '
+                f'src="data:video/webm;base64,{b64}"></video>'
+                if b64 else '<div class="media-tag">😀 Видео-стикер</div>'
+            )
         else:
-            media_html = f'<div class="media-tag">{label}</div>'
-        break
+            b64 = await _download_b64_budgeted(data["sticker"], budget)
+            media_html = (
+                f'<img class="media-img sticker" src="data:image/webp;base64,{b64}" alt="sticker">'
+                if b64 else '<div class="media-tag">😀 Стикер</div>'
+            )
+    elif data.get("document"):
+        media_html = '<div class="media-tag">📄 Документ</div>'
+    elif data.get("animation"):
+        b64 = await _download_b64_budgeted(data["animation"], budget)
+        media_html = (
+            f'<video class="media-video" controls loop muted autoplay src="data:video/mp4;base64,{b64}"></video>'
+            if b64 else '<div class="media-tag">🎬 GIF</div>'
+        )
 
     text_html = f'<div class="text">{text}</div>' if text else ""
     if not text_html and not media_html:
@@ -127,10 +180,10 @@ async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, pho
 
 
 async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict | None]], owner_id: int | None) -> str:
-    photo_budget = [MAX_EMBED_PHOTOS]
+    budget = [MAX_EMBED_BYTES]
     rows = []
     for msg_id, data in entries:
-        rows.append(await _bubble_html(msg_id, data, owner_id, photo_budget))
+        rows.append(await _bubble_html(msg_id, data, owner_id, budget))
     body = "\n".join(rows)
     generated = fmt(datetime.now(MSK))
     title_esc = html_mod.escape(chat_title)
@@ -176,7 +229,12 @@ async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict |
     display: inline-block; font-size: 13px; padding: 4px 8px;
     background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 4px;
   }}
-  .photo {{ max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }}
+  .media-img {{ max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }}
+  .media-img.sticker {{ max-width: 160px; background: transparent; }}
+  .media-video {{ max-width: 100%; border-radius: 10px; display: block; margin-bottom: 4px; }}
+  .media-video.round {{ border-radius: 50%; max-width: 220px; aspect-ratio: 1 / 1; object-fit: cover; }}
+  .media-video.sticker {{ max-width: 160px; border-radius: 0; }}
+  .media-audio {{ width: 100%; margin-bottom: 4px; }}
   @media (prefers-color-scheme: light) {{
     body {{ background: #f4f4f5; color: #1a1a1a; }}
     .header, .row.system span {{ background: #ffffff; }}
@@ -198,6 +256,26 @@ async def build_transcript_html(chat_title: str, entries: list[tuple[int, dict |
 </html>"""
 
 
+async def send_transcript_document(target_chat_id: int, chat_title: str, entries: list[tuple[int, dict | None]],
+                                    owner_id: int | None, caption: str):
+    html_doc = await build_transcript_html(chat_title, entries, owner_id)
+    safe_title = re.sub(r'[^0-9A-Za-zА-Яа-яЁё_-]+', '_', chat_title)[:40].strip('_') or "chat"
+    filename = f"chat_{safe_title}_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.html"
+    try:
+        await bot.send_document(
+            target_chat_id,
+            BufferedInputFile(html_doc.encode("utf-8"), filename=filename),
+            caption=caption,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        await bot.send_message(
+            target_chat_id,
+            f"{caption}\n\n{WARNING} Не удалось отправить файл: {html_mod.escape(str(e))}",
+            parse_mode="HTML",
+        )
+
+
 async def send_bulk_deleted_transcript(conn_id: str, owner_id: int, message_ids: list[int], deleted_at: str):
     entries = []
     chat_title = ""
@@ -210,10 +288,6 @@ async def send_bulk_deleted_transcript(conn_id: str, owner_id: int, message_ids:
 
     chat_title = chat_title or "Переписка"
     known = sum(1 for _, d in entries if d)
-    html_doc = await build_transcript_html(chat_title, entries, owner_id)
-
-    safe_title = re.sub(r'[^0-9A-Za-zА-Яа-яЁё_-]+', '_', chat_title)[:40].strip('_') or "chat"
-    filename = f"chat_{safe_title}_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}.html"
 
     caption = (
         f"{TRASH_ICON} <b>Переписка удалена целиком</b>\n"
@@ -222,19 +296,7 @@ async def send_bulk_deleted_transcript(conn_id: str, owner_id: int, message_ids:
         f"└ Удалено: <b>{deleted_at}</b>\n\n"
         f"📎 Полная переписка сохранена во вложении"
     )
-    try:
-        await bot.send_document(
-            owner_id,
-            BufferedInputFile(html_doc.encode("utf-8"), filename=filename),
-            caption=caption,
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        await bot.send_message(
-            owner_id,
-            f"{caption}\n\n{WARNING} Не удалось отправить файл: {html_mod.escape(str(e))}",
-            parse_mode="HTML",
-        )
+    await send_transcript_document(owner_id, chat_title, entries, owner_id, caption)
 
 # ─── ХРАНИЛИЩА ───────────────────────────────────────────────
 cache: dict[tuple, dict] = {}
@@ -787,6 +849,12 @@ async def on_business_message(message: Message):
         "video": message.video.file_id if message.video else None,
         "voice": message.voice.file_id if message.voice else None,
         "sticker": message.sticker.file_id if message.sticker else None,
+        "sticker_is_animated": bool(message.sticker.is_animated) if message.sticker else False,
+        "sticker_is_video": bool(message.sticker.is_video) if message.sticker else False,
+        "sticker_thumb": (
+            message.sticker.thumbnail.file_id
+            if message.sticker and message.sticker.thumbnail else None
+        ),
         "document": message.document.file_id if message.document else None,
         "animation": message.animation.file_id if message.animation else None,
         "video_note": message.video_note.file_id if message.video_note else None,
@@ -1173,6 +1241,53 @@ async def cmd_last(message: Message):
         await message.answer(chunk, parse_mode="HTML")
 
 
+@dp.message(Command("export"))
+async def cmd_export(message: Message):
+    if message.from_user.id != MY_USER_ID:
+        return
+    text = message.text or ""
+    match = re.search(r'@(\w+)', text)
+    if not match:
+        await message.answer("📋 <code>/export @username</code>", parse_mode="HTML")
+        return
+    username = match.group(1).lower()
+
+    entries = []
+    owner_id_for_chat = None
+    chat_title = ""
+    for (conn_id, msg_id), data in cache.items():
+        owner = connections.get(conn_id)
+        if not owner:
+            continue
+        owner_uname = owner.get("username", "")
+        chat_uname_raw = data.get("chat_uname", "").strip(" ()@").lower()
+        sender_uname_raw = data.get("sender_username", "").strip("@").lower()
+        if username in (owner_uname, chat_uname_raw, sender_uname_raw):
+            entries.append((msg_id, data))
+            if owner_id_for_chat is None:
+                owner_id_for_chat = owner.get("user_id")
+            if not chat_title:
+                chat_title = (data.get("chat_name") or "") + (data.get("chat_uname") or "")
+
+    if not entries:
+        await message.answer(f"📭 Нет сообщений для @{username} в кеше.")
+        return
+
+    entries.sort(key=lambda item: item[1]["sent_at"])
+    chat_title = chat_title or f"@{username}"
+
+    await message.answer(f"⏳ Готовлю переписку с @{username} ({len(entries)} сообщений)…")
+
+    caption = (
+        f"📤 <b>Экспорт переписки</b>\n"
+        f"├ Чат с: <b>{html_mod.escape(chat_title)}</b>\n"
+        f"├ Сообщений: <b>{len(entries)}</b>\n"
+        f"└ Сформировано: <b>{fmt(datetime.now(MSK))}</b>\n\n"
+        f"📎 Полная переписка во вложении"
+    )
+    await send_transcript_document(message.chat.id, chat_title, entries, owner_id_for_chat, caption)
+
+
 @dp.message(Command("exclude"))
 async def cmd_exclude(message: Message):
     if message.from_user.id != MY_USER_ID:
@@ -1264,6 +1379,7 @@ async def cmd_start(message: Message):
             "/exclude @user @chat — исключить чат\n"
             "/include @user @chat — вернуть чат\n"
             "/last @user 10 — последние сообщения\n"
+            "/export @user — вся переписка в HTML-файл\n"
             "/monitors — список\n"
             "/users — подключённые",
             parse_mode="HTML"
