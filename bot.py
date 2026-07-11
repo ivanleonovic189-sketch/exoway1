@@ -364,44 +364,73 @@ async def cache_cleanup_loop():
         if stale_keys:
             logging.info(f"cache_cleanup: удалено {len(stale_keys)} сообщений старше {CACHE_MAX_AGE_DAYS} дней")
 
-MONITORS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitors.json")
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+REDIS_URL = os.getenv("REDIS_URL", "")
+redis_client = None
+if REDIS_URL:
+    import redis as _redis
+    redis_client = _redis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        redis_client.ping()
+        logging.info("storage_backend: Redis (данные переживут перезапуск контейнера)")
+    except Exception as e:
+        logging.error(f"storage_backend: не удалось подключиться к Redis ({e}), падаю обратно на локальные JSON-файлы")
+        redis_client = None
+else:
+    logging.warning("storage_backend: REDIS_URL не задан, используются локальные JSON-файлы (данные будут теряться при пересоздании контейнера)")
+
+
+def _load_store(key: str, filename: str, default):
+    """Читает JSON-блоб из Redis (если настроен REDIS_URL), иначе из локального файла."""
+    if redis_client:
+        raw = redis_client.get(key)
+        if raw is None:
+            return default
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return default
+    try:
+        with open(os.path.join(DATA_DIR, filename), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def _save_store(key: str, filename: str, value) -> None:
+    if redis_client:
+        redis_client.set(key, json.dumps(value, ensure_ascii=False))
+        return
+    with open(os.path.join(DATA_DIR, filename), "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+
+
 monitors: dict[str, dict] = {}
 
 
 def load_monitors():
     global monitors
-    try:
-        with open(MONITORS_FILE, "r", encoding="utf-8") as f:
-            monitors = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        monitors = {}
+    monitors = _load_store("monitors", "monitors.json", {})
 
 
 def save_monitors():
-    with open(MONITORS_FILE, "w", encoding="utf-8") as f:
-        json.dump(monitors, f, ensure_ascii=False, indent=2)
+    _save_store("monitors", "monitors.json", monitors)
 
 
 load_monitors()
 
-REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
 reminders: list[dict] = []
 reminder_counter: int = 0
 
 
 def load_reminders():
     global reminders, reminder_counter
-    try:
-        with open(REMINDERS_FILE, "r", encoding="utf-8") as f:
-            reminders = json.load(f)
-        reminder_counter = max((r["id"] for r in reminders), default=0)
-    except (FileNotFoundError, json.JSONDecodeError):
-        reminders = []
+    reminders = _load_store("reminders", "reminders.json", [])
+    reminder_counter = max((r["id"] for r in reminders), default=0)
 
 
 def save_reminders():
-    with open(REMINDERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(reminders, f, ensure_ascii=False, indent=2)
+    _save_store("reminders", "reminders.json", reminders)
 
 
 def next_reminder_id() -> int:
@@ -414,22 +443,16 @@ load_reminders()
 
 DIGEST_HOUR_MSK = int(os.getenv("DIGEST_HOUR_MSK", "21"))  # во сколько слать ежедневную сводку, по МСК
 
-DIGEST_DISABLED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digest_disabled.json")
 digest_disabled: set[int] = set()
 
 
 def load_digest_disabled():
     global digest_disabled
-    try:
-        with open(DIGEST_DISABLED_FILE, "r", encoding="utf-8") as f:
-            digest_disabled = set(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        digest_disabled = set()
+    digest_disabled = set(_load_store("digest_disabled", "digest_disabled.json", []))
 
 
 def save_digest_disabled():
-    with open(DIGEST_DISABLED_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(digest_disabled), f)
+    _save_store("digest_disabled", "digest_disabled.json", list(digest_disabled))
 
 
 load_digest_disabled()
