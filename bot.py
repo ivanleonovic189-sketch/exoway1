@@ -457,6 +457,39 @@ def save_digest_disabled():
 
 load_digest_disabled()
 
+# Кто уже писал раньше (по conn_id) — чтобы "новые контакты" в сводке не считались
+# заново после каждого перезапуска контейнера (in-memory cache для этого не годится).
+known_senders: dict[str, list[int]] = {}
+
+
+def load_known_senders():
+    global known_senders
+    known_senders = _load_store("known_senders", "known_senders.json", {})
+
+
+def save_known_senders():
+    _save_store("known_senders", "known_senders.json", known_senders)
+
+
+load_known_senders()
+
+# "Ключевые моменты" для /info (сообщения, совпавшие с INFO_PATTERNS) — хранится отдельно
+# от cache и переживает рестарты, в отличие от полной переписки (та остаётся только в памяти).
+# Ключ: "{owner_id}:{username собеседника}".
+info_history: dict[str, list[dict]] = {}
+
+
+def load_info_history():
+    global info_history
+    info_history = _load_store("info_history", "info_history.json", {})
+
+
+def save_info_history():
+    _save_store("info_history", "info_history.json", info_history)
+
+
+load_info_history()
+
 
 def fmt(dt: datetime) -> str:
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
@@ -1100,6 +1133,12 @@ async def on_business_message(message: Message):
         "video_note": message.video_note.file_id if message.video_note else None,
     }
 
+    if owner_id and message.chat.username and text_matches_info_pattern(cache[key]["text"]):
+        remember_info_moment(
+            owner_id, message.chat.username, message.message_id,
+            sender_name, cache[key]["text"], cache[key]["sent_at"],
+        )
+
     # Инфо об ответе на сообщение
     reply = message.reply_to_message
     if reply:
@@ -1653,12 +1692,11 @@ async def send_daily_digest(conn_id: str, owner_id: int, now: datetime):
         return
     senders = {d["sender_id"] for d in incoming if d.get("sender_id")}
 
-    earlier_senders = {
-        data["sender_id"]
-        for (cid, _mid), data in cache.items()
-        if cid == conn_id and data.get("sent_at") and data["sent_at"].date() < today and data.get("sender_id")
-    }
+    earlier_senders = set(known_senders.get(conn_id, []))
     new_senders = senders - earlier_senders
+
+    known_senders[conn_id] = list(earlier_senders | senders)
+    save_known_senders()
 
     lines = [
         f"📅 <b>Итоги дня</b> — {now.strftime('%d.%m.%Y')} (МСК)\n",
@@ -1807,6 +1845,31 @@ def scan_info(entries: list[tuple[int, dict]]) -> dict[str, list[tuple[str, str,
     return found
 
 
+def text_matches_info_pattern(text: str) -> bool:
+    if not text:
+        return False
+    return any(
+        re.search(pattern, text, re.IGNORECASE)
+        for _, patterns in INFO_PATTERNS
+        for pattern in patterns
+    )
+
+
+def remember_info_moment(owner_id: int, chat_username: str, msg_id: int, sender_name: str, text: str, sent_at: datetime) -> None:
+    """Сохраняет сообщение, совпавшее с INFO_PATTERNS, чтобы /info видел его и после рестарта."""
+    hist_key = f"{owner_id}:{chat_username.lower()}"
+    entries = info_history.setdefault(hist_key, [])
+    if any(e["msg_id"] == msg_id for e in entries):
+        return
+    entries.append({
+        "msg_id": msg_id,
+        "sent_at": sent_at.isoformat(),
+        "sender_name": sender_name,
+        "text": text,
+    })
+    save_info_history()
+
+
 async def run_info(message: Message, text: str):
     match = re.search(r'@(\w+)', text)
     if not match:
@@ -1821,6 +1884,24 @@ async def run_info(message: Message, text: str):
     since, since_token = parse_since_token(text)
 
     entries, chat_title = find_own_conversation(message.from_user.id, username, since)
+
+    # Подмешиваем персистентную историю ключевых моментов — она переживает рестарты,
+    # в отличие от cache, поэтому старые совпадения не теряются.
+    seen_ids = {msg_id for msg_id, _ in entries}
+    for item in info_history.get(f"{message.from_user.id}:{username}", []):
+        if item["msg_id"] in seen_ids:
+            continue
+        sent_at = datetime.fromisoformat(item["sent_at"])
+        if since and sent_at < since:
+            continue
+        entries.append((item["msg_id"], {
+            "sent_at": sent_at,
+            "sender_name": item["sender_name"],
+            "text": item["text"],
+        }))
+        seen_ids.add(item["msg_id"])
+    entries.sort(key=lambda e: e[1]["sent_at"])
+
     if not entries:
         period_note = f" за последние {since_token}" if since_token else ""
         await message.answer(f"📭 Нет сообщений с @{username}{period_note} в кеше.")
