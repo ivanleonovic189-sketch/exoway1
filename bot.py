@@ -221,11 +221,12 @@ async def clone_voice(text: str, ref_url: str) -> str | None:
 
 async def serve_voice_ref(request):
     """Отдаёт образец голоса HF Space по одноразовому токену — так публичный URL не палит BOT_TOKEN."""
-    token = request.match_info.get("token", "")
+    raw_token = request.match_info.get("token", "")
+    token = raw_token.rsplit(".", 1)[0]
     data = voice_ref_store.pop(token, None)
     if data is None:
         return web.Response(status=404)
-    return web.Response(body=data, content_type="audio/ogg")
+    return web.Response(body=data, content_type="audio/wav")
 
 
 async def run_voice_clone(message: Message, text: str, profile: str):
@@ -242,7 +243,7 @@ async def run_voice_clone(message: Message, text: str, profile: str):
 
     token = secrets.token_urlsafe(16)
     voice_ref_store[token] = raw
-    ref_url = f"https://{domain}/voice_ref/{token}"
+    ref_url = f"https://{domain}/voice_ref/{token}.wav"
 
     status = await message.answer(f"🗣 Озвучиваю {label}… может занять минуту, это бесплатный сервис")
     try:
