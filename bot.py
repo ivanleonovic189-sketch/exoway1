@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import secrets
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -182,6 +183,84 @@ async def transcribe_audio(raw: bytes, filename: str) -> str | None:
         if text:
             return text
     return None
+
+
+# ─── Клонирование голоса (бесплатный community HF Space, без гарантий) ─
+HF_VOICE_CLONE_SPACE = "hasanbasbunar/Voice-Cloning-XTTS-v2"
+named_voice_profiles: dict[str, bytes] = {}   # "мелстрой" и т.п. -> байты образца, доступно всем юзерам бота
+voice_ref_store: dict[str, bytes] = {}     # одноразовый токен -> байты образца, отдаётся HF Space по URL
+_hf_voice_client = None
+
+
+def _get_hf_voice_client():
+    global _hf_voice_client
+    if _hf_voice_client is None:
+        from gradio_client import Client
+        _hf_voice_client = Client(HF_VOICE_CLONE_SPACE)
+    return _hf_voice_client
+
+
+def _clone_voice_sync(text: str, ref_url: str) -> str | None:
+    try:
+        client = _get_hf_voice_client()
+        return client.predict(
+            text=text,
+            reference_audio_url=ref_url,
+            language="Russian",
+            api_name="/voice_clone_synthesis",
+        )
+    except Exception as e:
+        logging.warning(f"voice clone failed: {e}")
+        return None
+
+
+async def clone_voice(text: str, ref_url: str) -> str | None:
+    """Возвращает путь к локальному файлу со сгенерированной озвучкой, либо None."""
+    return await asyncio.to_thread(_clone_voice_sync, text, ref_url)
+
+
+async def serve_voice_ref(request):
+    """Отдаёт образец голоса HF Space по одноразовому токену — так публичный URL не палит BOT_TOKEN."""
+    token = request.match_info.get("token", "")
+    data = voice_ref_store.pop(token, None)
+    if data is None:
+        return web.Response(status=404)
+    return web.Response(body=data, content_type="audio/ogg")
+
+
+async def run_voice_clone(message: Message, text: str, profile: str):
+    raw = named_voice_profiles.get(profile)
+    if not raw:
+        await message.answer(f"{WARNING} Такого голоса нет.")
+        return
+    label = f"голосом «{profile}»"
+
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
+    if not domain:
+        await message.answer(f"{WARNING} Не настроен публичный домен — озвучка недоступна.")
+        return
+
+    token = secrets.token_urlsafe(16)
+    voice_ref_store[token] = raw
+    ref_url = f"https://{domain}/voice_ref/{token}"
+
+    status = await message.answer(f"🗣 Озвучиваю {label}… может занять минуту, это бесплатный сервис")
+    try:
+        result_path = await clone_voice(text, ref_url)
+    finally:
+        voice_ref_store.pop(token, None)
+
+    if not result_path:
+        await status.edit_text(f"{WARNING} Не удалось озвучить — бесплатный сервис клонирования сейчас недоступен, попробуй позже.")
+        return
+
+    try:
+        with open(result_path, "rb") as f:
+            audio_bytes = f.read()
+        await message.answer_audio(BufferedInputFile(audio_bytes, filename="voice.mp3"))
+        await status.delete()
+    except Exception as e:
+        await status.edit_text(f"{WARNING} Сгенерировал, но не смог отправить: {html_mod.escape(str(e))}")
 
 
 async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, budget: list[int]) -> str:
@@ -573,6 +652,20 @@ def save_muted_connections():
 
 
 load_muted_connections()
+
+
+def load_named_voice_profiles():
+    global named_voice_profiles
+    raw = _load_store("named_voice_profiles", "named_voice_profiles.json", {})
+    named_voice_profiles = {name: base64.b64decode(b64) for name, b64 in raw.items()}
+
+
+def save_named_voice_profiles():
+    raw = {name: base64.b64encode(data).decode() for name, data in named_voice_profiles.items()}
+    _save_store("named_voice_profiles", "named_voice_profiles.json", raw)
+
+
+load_named_voice_profiles()
 
 # Сообщения, удалённые самим ботом через .mute — чтобы on_deleted_business
 # не слал владельцу уведомление об их удалении. In-memory: живёт секунды,
@@ -2188,7 +2281,7 @@ async def cmd_debug(message: Message):
 
 # ─── Кнопочное меню (без команд) ──────────────────────────────
 MENU_BUTTON_TEXT = "☰ Меню"
-pending_action: dict[int, str] = {}   # user_id -> "export" | "info" | "remind" | "cancel"
+pending_action: dict[int, str] = {}   # user_id -> "export" | "info" | "remind" | "voiceclone" | "cancel"
 
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -2215,6 +2308,10 @@ def menu_inline_keyboard(user_id: int) -> InlineKeyboardMarkup:
             icon_custom_emoji_id=EMOJI_EXPORT_PROGRESS_ID,
         )],
         [InlineKeyboardButton(text="📋 Мои напоминания", callback_data="menu_reminders")],
+        *[
+            [InlineKeyboardButton(text=f"🗣 Сказать голосом «{name}»", callback_data=f"menu_voiceclone:{name}")]
+            for name in named_voice_profiles
+        ],
         [InlineKeyboardButton(text=digest_label, callback_data="menu_toggle_digest")],
     ])
 
@@ -2280,6 +2377,10 @@ async def on_menu_callback(callback: CallbackQuery):
     elif action == "menu_reminders":
         pending_action.pop(uid, None)
         await run_reminders(callback.message, uid)
+    elif action.startswith("menu_voiceclone:"):
+        profile = action.split(":", 1)[1]
+        pending_action[uid] = f"voiceclone:{profile}"
+        await callback.message.answer("🗣 Напиши текст, который озвучить.")
     elif action == "menu_toggle_digest":
         if uid in digest_disabled:
             digest_disabled.discard(uid)
@@ -2325,21 +2426,22 @@ async def on_cancel_reminder_button(callback: CallbackQuery):
 
 @dp.message((F.chat.type == "private") & (F.voice | F.video_note))
 async def on_voice_or_video_note(message: Message):
-    if not GROQ_API_KEY and not (CF_ACCOUNT_ID and CF_API_TOKEN):
-        await message.answer(f"{WARNING} Расшифровка не настроена (нет GROQ_API_KEY / CF_ACCOUNT_ID+CF_API_TOKEN).")
-        return
-
     media = message.voice or message.video_note
     filename = "voice.ogg" if message.voice else "video_note.mp4"
 
-    status = await message.answer("🎧 Расшифровываю…")
     try:
         file_info = await bot.get_file(media.file_id)
         buf = await bot.download_file(file_info.file_path)
-        text = await transcribe_audio(buf.read(), filename)
+        raw = buf.read()
     except Exception as e:
-        text = None
+        raw = None
         logging.warning(f"voice/video_note download failed: {e}")
+
+    if not GROQ_API_KEY and not (CF_ACCOUNT_ID and CF_API_TOKEN):
+        return
+
+    status = await message.answer("🎧 Расшифровываю…")
+    text = await transcribe_audio(raw, filename) if raw else None
 
     if text:
         await status.edit_text(f"🎧 <b>Расшифровка:</b>\n{html_mod.escape(text)}", parse_mode="HTML")
@@ -2364,6 +2466,8 @@ async def on_pending_input(message: Message):
         await run_info(message, arg)
     elif action == "remind":
         await run_remind(message, text)
+    elif action.startswith("voiceclone:"):
+        await run_voice_clone(message, text, profile=action.split(":", 1)[1])
 
 
 @dp.message(Command("start"))
@@ -2443,6 +2547,7 @@ async def main():
     async def health(request):
         return web.Response(text="OK")
     app.router.add_get("/", health)
+    app.router.add_get("/voice_ref/{token}", serve_voice_ref)
 
     if domain and port:
         # ─── Railway: webhook ─────────────────────────────
