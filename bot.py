@@ -342,7 +342,7 @@ async def send_bulk_deleted_transcript(conn_id: str, owner_id: int, message_ids:
 # ─── ХРАНИЛИЩА ───────────────────────────────────────────────
 cache: dict[tuple, dict] = {}
 connections: dict[str, dict] = {}
-active_modes: dict[str, str] = {}   # conn_id -> "kawaii" | "bydlo" | "crazy"
+active_modes: dict[str, str] = {}   # "{conn_id}:{chat_id}" -> "kawaii" | "bydlo" | "crazy"
 custom_emoji_love: list[str] = []   # LoveDayEmoji
 custom_emoji_mad: list[str] = []    # MadEmoji
 user_numbers: dict[int, int] = {}   # user_id -> #N
@@ -884,7 +884,7 @@ async def on_business_message(message: Message):
     raw_text = message.text or ""
 
     # ─── .mute — молча удаляет входящие от собеседника ────
-    if conn_id in muted_connections and message.from_user:
+    if f"{conn_id}:{message.chat.id}" in muted_connections and message.from_user:
         owner_mute = await get_owner(conn_id)
         if owner_mute and message.from_user.id != owner_mute["user_id"]:
             try:
@@ -978,11 +978,12 @@ async def on_business_message(message: Message):
     if cmd_lower in (".mute", ".unmute"):
         owner = await get_owner(conn_id)
         if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            scope_key = f"{conn_id}:{message.chat.id}"
             if cmd_lower == ".mute":
-                muted_connections.add(conn_id)
+                muted_connections.add(scope_key)
                 status_text = "shut up!"
             else:
-                muted_connections.discard(conn_id)
+                muted_connections.discard(scope_key)
                 status_text = "🔊 Мут отключён"
             save_muted_connections()
             try:
@@ -1001,9 +1002,10 @@ async def on_business_message(message: Message):
         mode_name = cmd_lower[1:]  # "kawaii" / "bydlo" / "crazy"
         owner = await get_owner(conn_id)
         if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            scope_key = f"{conn_id}:{message.chat.id}"
             emoji, label = MODE_INFO[mode_name]
-            if active_modes.get(conn_id) == mode_name:
-                del active_modes[conn_id]
+            if active_modes.get(scope_key) == mode_name:
+                del active_modes[scope_key]
                 save_active_modes()
                 try:
                     await bot.edit_message_text(
@@ -1015,7 +1017,7 @@ async def on_business_message(message: Message):
                 except Exception:
                     pass
             else:
-                active_modes[conn_id] = mode_name
+                active_modes[scope_key] = mode_name
                 save_active_modes()
                 try:
                     await bot.edit_message_text(
@@ -1124,10 +1126,11 @@ async def on_business_message(message: Message):
             return
 
     # ─── Режим речи (kawaii / bydlo / crazy) ──────────────
-    if conn_id in active_modes and raw_text and not raw_text.startswith("."):
+    mode_scope_key = f"{conn_id}:{message.chat.id}"
+    if mode_scope_key in active_modes and raw_text and not raw_text.startswith("."):
         owner = await get_owner(conn_id)
         if owner and message.from_user and message.from_user.id == owner["user_id"]:
-            transform = MODE_TRANSFORM[active_modes[conn_id]]
+            transform = MODE_TRANSFORM[active_modes[mode_scope_key]]
             try:
                 await bot.edit_message_text(
                     text=transform(raw_text),
