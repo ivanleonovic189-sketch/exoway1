@@ -14,3 +14,7 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
+      - key: CF_ACCOUNT_ID
+        sync: false
+      - key: CF_API_TOKEN
+        sync: false

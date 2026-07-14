@@ -34,6 +34,8 @@ if env_path.exists():
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
+CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 # ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -127,10 +129,7 @@ async def _download_b64_budgeted(file_id: str, budget: list[int]) -> str | None:
         return None
 
 
-async def transcribe_audio(raw: bytes, filename: str) -> str | None:
-    """Расшифровывает голосовое/кружок в текст через бесплатный Groq Whisper API."""
-    if not GROQ_API_KEY:
-        return None
+async def _transcribe_groq(raw: bytes, filename: str) -> str | None:
     form = aiohttp.FormData()
     form.add_field("file", raw, filename=filename, content_type="application/octet-stream")
     form.add_field("model", "whisper-large-v3-turbo")
@@ -150,6 +149,39 @@ async def transcribe_audio(raw: bytes, filename: str) -> str | None:
     except Exception as e:
         logging.warning(f"Groq transcribe error: {e}")
         return None
+
+
+async def _transcribe_cloudflare(raw: bytes) -> str | None:
+    payload = {"audio": base64.b64encode(raw).decode()}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/openai/whisper-large-v3-turbo",
+                headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                body = await resp.json()
+                if resp.status != 200 or not body.get("success"):
+                    logging.warning(f"Cloudflare transcribe failed: {resp.status} {body}")
+                    return None
+                return (body.get("result", {}).get("text") or "").strip() or None
+    except Exception as e:
+        logging.warning(f"Cloudflare transcribe error: {e}")
+        return None
+
+
+async def transcribe_audio(raw: bytes, filename: str) -> str | None:
+    """Расшифровывает голосовое/кружок в текст — Groq, если настроен, иначе Cloudflare Workers AI."""
+    if GROQ_API_KEY:
+        text = await _transcribe_groq(raw, filename)
+        if text:
+            return text
+    if CF_ACCOUNT_ID and CF_API_TOKEN:
+        text = await _transcribe_cloudflare(raw)
+        if text:
+            return text
+    return None
 
 
 async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, budget: list[int]) -> str:
@@ -2279,8 +2311,8 @@ async def on_cancel_reminder_button(callback: CallbackQuery):
 async def on_voice_or_video_note(message: Message):
     if message.from_user.id != MY_USER_ID:
         return
-    if not GROQ_API_KEY:
-        await message.answer(f"{WARNING} Расшифровка не настроена (нет GROQ_API_KEY).")
+    if not GROQ_API_KEY and not (CF_ACCOUNT_ID and CF_API_TOKEN):
+        await message.answer(f"{WARNING} Расшифровка не настроена (нет GROQ_API_KEY / CF_ACCOUNT_ID+CF_API_TOKEN).")
         return
 
     media = message.voice or message.video_note
