@@ -901,6 +901,20 @@ async def send_media(user_id: int, data: dict, header: str):
         await bot.send_message(user_id, f"{header}\n\n{WARNING} Ошибка отправки: {html_mod.escape(str(e))}", parse_mode="HTML")
 
 
+async def _send_transcript_followup(user_id: int, file_id: str, filename: str):
+    """Фоново расшифровывает голосовое/кружок и шлёт текст следом, не задерживая пересылку."""
+    if not GROQ_API_KEY and not (CF_ACCOUNT_ID and CF_API_TOKEN):
+        return
+    try:
+        file_info = await bot.get_file(file_id)
+        buf = await bot.download_file(file_info.file_path)
+        text = await transcribe_audio(buf.read(), filename)
+        if text:
+            await bot.send_message(user_id, f"🎧 <i>{html_mod.escape(text)}</i>", parse_mode="HTML")
+    except Exception as e:
+        logging.warning(f"live transcript failed: {e}")
+
+
 async def send_live_media(user_id: int, message: Message, header: str):
     try:
         msg_text = message.text or message.caption or ""
@@ -913,6 +927,7 @@ async def send_live_media(user_id: int, message: Message, header: str):
         elif message.voice:
             await bot.send_message(user_id, header, parse_mode="HTML")
             await bot.send_voice(user_id, message.voice.file_id)
+            asyncio.create_task(_send_transcript_followup(user_id, message.voice.file_id, "voice.ogg"))
         elif message.sticker:
             await bot.send_message(user_id, header, parse_mode="HTML")
             await bot.send_sticker(user_id, message.sticker.file_id)
@@ -925,6 +940,7 @@ async def send_live_media(user_id: int, message: Message, header: str):
         elif message.video_note:
             await bot.send_message(user_id, header, parse_mode="HTML")
             await bot.send_video_note(user_id, message.video_note.file_id)
+            asyncio.create_task(_send_transcript_followup(user_id, message.video_note.file_id, "video_note.mp4"))
         else:
             body = f"\n\n💬 {msg_text}" if msg_text else ""
             if body:
