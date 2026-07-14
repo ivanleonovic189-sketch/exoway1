@@ -1133,7 +1133,10 @@ async def on_business_message(message: Message):
         "video_note": message.video_note.file_id if message.video_note else None,
     }
 
-    if owner_id and message.chat.username and text_matches_info_pattern(cache[key]["text"]):
+    if (
+        owner_id and sender_id != owner_id and message.chat.username
+        and text_matches_info_pattern(cache[key]["text"])
+    ):
         remember_info_moment(
             owner_id, message.chat.username, message.message_id,
             sender_name, cache[key]["text"], cache[key]["sent_at"],
@@ -1884,6 +1887,8 @@ async def run_info(message: Message, text: str):
     since, since_token = parse_since_token(text)
 
     entries, chat_title = find_own_conversation(message.from_user.id, username, since)
+    # Ключевые моменты — только по словам собеседника, не по своим же сообщениям
+    entries = [(msg_id, data) for msg_id, data in entries if data.get("sender_id") != message.from_user.id]
 
     # Подмешиваем персистентную историю ключевых моментов — она переживает рестарты,
     # в отличие от cache, поэтому старые совпадения не теряются.
