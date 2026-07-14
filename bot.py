@@ -10,6 +10,7 @@ import re
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -32,6 +33,7 @@ if env_path.exists():
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -122,6 +124,31 @@ async def _download_b64_budgeted(file_id: str, budget: list[int]) -> str | None:
         return base64.b64encode(raw).decode()
     except Exception as e:
         logging.warning(f"Не удалось скачать медиа {file_id}: {e}")
+        return None
+
+
+async def transcribe_audio(raw: bytes, filename: str) -> str | None:
+    """Расшифровывает голосовое/кружок в текст через бесплатный Groq Whisper API."""
+    if not GROQ_API_KEY:
+        return None
+    form = aiohttp.FormData()
+    form.add_field("file", raw, filename=filename, content_type="application/octet-stream")
+    form.add_field("model", "whisper-large-v3-turbo")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                body = await resp.json()
+                if resp.status != 200:
+                    logging.warning(f"Groq transcribe failed: {resp.status} {body}")
+                    return None
+                return (body.get("text") or "").strip() or None
+    except Exception as e:
+        logging.warning(f"Groq transcribe error: {e}")
         return None
 
 
@@ -2246,6 +2273,32 @@ async def on_cancel_reminder_button(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer("✅ Отменено")
+
+
+@dp.message((F.chat.type == "private") & (F.voice | F.video_note))
+async def on_voice_or_video_note(message: Message):
+    if message.from_user.id != MY_USER_ID:
+        return
+    if not GROQ_API_KEY:
+        await message.answer(f"{WARNING} Расшифровка не настроена (нет GROQ_API_KEY).")
+        return
+
+    media = message.voice or message.video_note
+    filename = "voice.ogg" if message.voice else "video_note.mp4"
+
+    status = await message.answer("🎧 Расшифровываю…")
+    try:
+        file_info = await bot.get_file(media.file_id)
+        buf = await bot.download_file(file_info.file_path)
+        text = await transcribe_audio(buf.read(), filename)
+    except Exception as e:
+        text = None
+        logging.warning(f"voice/video_note download failed: {e}")
+
+    if text:
+        await status.edit_text(f"🎧 <b>Расшифровка:</b>\n{html_mod.escape(text)}", parse_mode="HTML")
+    else:
+        await status.edit_text(f"{WARNING} Не удалось расшифровать.")
 
 
 @dp.message((F.chat.type == "private") & F.text & ~F.text.startswith("/"))

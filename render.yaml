@@ -12,3 +12,5 @@ services:
         sync: false
       - key: REDIS_URL
         sync: false
+      - key: GROQ_API_KEY
+        sync: false
