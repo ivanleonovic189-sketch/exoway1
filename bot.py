@@ -2325,8 +2325,6 @@ async def on_cancel_reminder_button(callback: CallbackQuery):
 
 @dp.message((F.chat.type == "private") & (F.voice | F.video_note))
 async def on_voice_or_video_note(message: Message):
-    if message.from_user.id != MY_USER_ID:
-        return
     if not GROQ_API_KEY and not (CF_ACCOUNT_ID and CF_API_TOKEN):
         await message.answer(f"{WARNING} Расшифровка не настроена (нет GROQ_API_KEY / CF_ACCOUNT_ID+CF_API_TOKEN).")
         return
