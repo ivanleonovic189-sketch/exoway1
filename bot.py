@@ -980,7 +980,7 @@ async def on_business_message(message: Message):
         if owner and message.from_user and message.from_user.id == owner["user_id"]:
             if cmd_lower == ".mute":
                 muted_connections.add(conn_id)
-                status_text = "🔇 Мут включён — сообщения собеседника будут удаляться молча"
+                status_text = "shut up!"
             else:
                 muted_connections.discard(conn_id)
                 status_text = "🔊 Мут отключён"
