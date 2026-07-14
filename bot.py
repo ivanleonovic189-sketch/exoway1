@@ -490,6 +490,36 @@ def save_info_history():
 
 load_info_history()
 
+def load_active_modes():
+    global active_modes
+    active_modes = _load_store("active_modes", "active_modes.json", {})
+
+
+def save_active_modes():
+    _save_store("active_modes", "active_modes.json", active_modes)
+
+
+load_active_modes()
+
+muted_connections: set[str] = set()
+
+
+def load_muted_connections():
+    global muted_connections
+    muted_connections = set(_load_store("muted_connections", "muted_connections.json", []))
+
+
+def save_muted_connections():
+    _save_store("muted_connections", "muted_connections.json", list(muted_connections))
+
+
+load_muted_connections()
+
+# Сообщения, удалённые самим ботом через .mute — чтобы on_deleted_business
+# не слал владельцу уведомление об их удалении. In-memory: живёт секунды,
+# ровно до прихода вебхука об удалении, персистентность не нужна.
+muted_deleted_ids: set[tuple[str, int]] = set()
+
 
 def fmt(dt: datetime) -> str:
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M:%S")
@@ -853,6 +883,20 @@ async def on_business_message(message: Message):
     conn_id = message.business_connection_id
     raw_text = message.text or ""
 
+    # ─── .mute — молча удаляет входящие от собеседника ────
+    if conn_id in muted_connections and message.from_user:
+        owner_mute = await get_owner(conn_id)
+        if owner_mute and message.from_user.id != owner_mute["user_id"]:
+            try:
+                await bot.delete_business_messages(
+                    business_connection_id=conn_id,
+                    message_ids=[message.message_id],
+                )
+                muted_deleted_ids.add((conn_id, message.message_id))
+            except Exception as e:
+                logging.warning(f".mute: не удалось удалить сообщение: {e}")
+            return
+
     # ─── .type команда ───────────────────────────────────────
     if raw_text.lower().startswith(".type ") and len(raw_text) > 6:
         typed_text = raw_text[6:]
@@ -929,8 +973,30 @@ async def on_business_message(message: Message):
                     await asyncio.sleep(delay)
             return
 
-    # ─── .kawaii / .bydlo / .crazy (режимы речи) ─────────
+    # ─── .mute / .unmute ──────────────────────────────────
     cmd_lower = raw_text.lower().strip()
+    if cmd_lower in (".mute", ".unmute"):
+        owner = await get_owner(conn_id)
+        if owner and message.from_user and message.from_user.id == owner["user_id"]:
+            if cmd_lower == ".mute":
+                muted_connections.add(conn_id)
+                status_text = "🔇 Мут включён — сообщения собеседника будут удаляться молча"
+            else:
+                muted_connections.discard(conn_id)
+                status_text = "🔊 Мут отключён"
+            save_muted_connections()
+            try:
+                await bot.edit_message_text(
+                    text=status_text,
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    business_connection_id=conn_id,
+                )
+            except Exception:
+                pass
+            return
+
+    # ─── .kawaii / .bydlo / .crazy (режимы речи) ─────────
     if cmd_lower in (".kawaii", ".bydlo", ".crazy"):
         mode_name = cmd_lower[1:]  # "kawaii" / "bydlo" / "crazy"
         owner = await get_owner(conn_id)
@@ -938,6 +1004,7 @@ async def on_business_message(message: Message):
             emoji, label = MODE_INFO[mode_name]
             if active_modes.get(conn_id) == mode_name:
                 del active_modes[conn_id]
+                save_active_modes()
                 try:
                     await bot.edit_message_text(
                         text=f"💔 {label} отключён",
@@ -949,6 +1016,7 @@ async def on_business_message(message: Message):
                     pass
             else:
                 active_modes[conn_id] = mode_name
+                save_active_modes()
                 try:
                     await bot.edit_message_text(
                         text=f"{emoji} {label} включён~\nчтобы отключить, введите {cmd_lower}",
@@ -1212,27 +1280,38 @@ async def on_deleted_business(event: BusinessMessagesDeleted):
     logging.info(f">>> deleted_business_messages conn={event.business_connection_id}, ids={event.message_ids}")
     deleted_at = fmt(datetime.now(MSK))
     conn_id = event.business_connection_id
+
+    # Сообщения, которые удалил сам .mute — владельцу об этом не сообщаем
+    message_ids = []
+    for msg_id in event.message_ids:
+        if (conn_id, msg_id) in muted_deleted_ids:
+            muted_deleted_ids.discard((conn_id, msg_id))
+        else:
+            message_ids.append(msg_id)
+    if not message_ids:
+        return
+
     owner = await get_owner(conn_id)
     owner_id = owner["user_id"] if owner else None
 
     if not owner_id:
-        logging.warning(f"deleted_business_messages: не удалось определить владельца conn={conn_id}, ids={event.message_ids}")
+        logging.warning(f"deleted_business_messages: не удалось определить владельца conn={conn_id}, ids={message_ids}")
         if MY_USER_ID:
             await bot.send_message(
                 MY_USER_ID,
                 f"{WARNING} <b>Не удалось обработать удаление</b>\n"
                 f"├ conn_id: <code>{html_mod.escape(conn_id or '')}</code>\n"
-                f"├ Удалено сообщений: <b>{len(event.message_ids)}</b>\n"
+                f"├ Удалено сообщений: <b>{len(message_ids)}</b>\n"
                 f"└ Причина: не резолвится владелец подключения (get_business_connection упал или соединение неизвестно)",
                 parse_mode="HTML"
             )
         return
 
-    if len(event.message_ids) >= BULK_DELETE_THRESHOLD:
-        await send_bulk_deleted_transcript(conn_id, owner_id, event.message_ids, deleted_at)
+    if len(message_ids) >= BULK_DELETE_THRESHOLD:
+        await send_bulk_deleted_transcript(conn_id, owner_id, message_ids, deleted_at)
         return
 
-    for msg_id in event.message_ids:
+    for msg_id in message_ids:
         key = (conn_id, msg_id)
         data = cache.pop(key, None)
 
