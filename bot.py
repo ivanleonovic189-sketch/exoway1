@@ -206,6 +206,7 @@ def _clone_voice_sync(text: str, ref_url: str) -> str | None:
         return client.predict(
             text=text,
             reference_audio_url=ref_url,
+            example_audio_name=None,
             language="Russian",
             api_name="/voice_clone_synthesis",
         )
