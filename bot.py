@@ -17,7 +17,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     BufferedInputFile, Message, BusinessMessagesDeleted, BusinessConnection,
     ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery,
+    CallbackQuery, InlineQuery, InlineQueryResultArticle, InputTextMessageContent,
+    ChosenInlineResult, InputMediaAudio,
 )
 from aiogram.filters import Command, BaseFilter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -62,6 +63,7 @@ EMOJI_KEY_MOMENTS_ID = "5456140674028019486"
 EMOJI_INFO_FAMILY_ID = "5235470249406512502"
 EMOJI_INFO_HOBBY_ID = "5197371802136892976"
 EMOJI_INFO_FEAR_ID = "5330403668191618210"
+EMOJI_MIC_ID = "5386367538735104399"
 
 
 def pemoji(emoji_id: str, fallback: str) -> str:
@@ -72,6 +74,7 @@ def pemoji(emoji_id: str, fallback: str) -> str:
 WARNING = pemoji(EMOJI_WARNING_ID, "⚠️")
 EDIT_ICON = pemoji(EMOJI_EDIT_ID, "✏️")
 TRASH_ICON = pemoji(EMOJI_TRASH_ID, "🗑")
+MIC = pemoji(EMOJI_MIC_ID, "🗣")
 EXPORT_PROGRESS = pemoji(EMOJI_EXPORT_PROGRESS_ID, "⏳")
 EXPORT_DONE = pemoji(EMOJI_EXPORT_DONE_ID, "✅")
 INFO_LOVE = pemoji(EMOJI_INFO_LOVE_ID, "💘")
@@ -189,6 +192,7 @@ async def transcribe_audio(raw: bytes, filename: str) -> str | None:
 HF_VOICE_CLONE_SPACE = "hasanbasbunar/Voice-Cloning-XTTS-v2"
 named_voice_profiles: dict[str, bytes] = {}   # "мелстрой" и т.п. -> байты образца, доступно всем юзерам бота
 voice_ref_store: dict[str, bytes] = {}     # одноразовый токен -> байты образца, отдаётся HF Space по URL
+voice_gen_store: dict[str, bytes] = {}     # одноразовый токен -> сгенерированное аудио, для инлайн-режима (Telegram сам его скачивает по URL)
 _hf_voice_client = None
 
 
@@ -230,39 +234,66 @@ async def serve_voice_ref(request):
     return web.Response(body=data, content_type="audio/wav")
 
 
-async def run_voice_clone(message: Message, text: str, profile: str):
+async def serve_voice_gen(request):
+    """Отдаёт сгенерированную озвучку по одноразовому токену — Telegram сам её скачивает при inline-редактировании."""
+    raw_token = request.match_info.get("token", "")
+    token = raw_token.rsplit(".", 1)[0]
+    data = voice_gen_store.pop(token, None)
+    if data is None:
+        return web.Response(status=404)
+    return web.Response(body=data, content_type="audio/mpeg")
+
+
+async def _generate_voice_clone(profile: str, text: str) -> bytes | None:
+    """Возвращает mp3-байты сгенерированной озвучки, либо None при ошибке."""
     raw = named_voice_profiles.get(profile)
     if not raw:
-        await message.answer(f"{WARNING} Такого голоса нет.")
-        return
-    label = f"голосом «{profile}»"
-
+        return None
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
     if not domain:
-        await message.answer(f"{WARNING} Не настроен публичный домен — озвучка недоступна.")
-        return
+        return None
 
     token = secrets.token_urlsafe(16)
     voice_ref_store[token] = raw
     ref_url = f"https://{domain}/voice_ref/{token}.wav"
-
-    status = await message.answer(f"🗣 Озвучиваю {label}… может занять минуту, это бесплатный сервис")
     try:
         result_path = await clone_voice(text, ref_url)
     finally:
         voice_ref_store.pop(token, None)
 
     if not result_path:
-        await status.edit_text(f"{WARNING} Не удалось озвучить — бесплатный сервис клонирования сейчас недоступен, попробуй позже.")
-        return
-
+        return None
     try:
         with open(result_path, "rb") as f:
-            audio_bytes = f.read()
-        await message.answer_audio(BufferedInputFile(audio_bytes, filename="voice.mp3"))
-        await status.delete()
+            return f.read()
     except Exception as e:
-        await status.edit_text(f"{WARNING} Сгенерировал, но не смог отправить: {html_mod.escape(str(e))}")
+        logging.warning(f"voice clone read failed: {e}")
+        return None
+
+
+def _mp3_to_ogg_opus_sync(mp3_bytes: bytes) -> bytes | None:
+    import subprocess
+    import tempfile
+    import imageio_ffmpeg
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as src, tempfile.NamedTemporaryFile(suffix=".ogg") as dst:
+        src.write(mp3_bytes)
+        src.flush()
+        try:
+            subprocess.run(
+                [ffmpeg, "-y", "-i", src.name, "-c:a", "libopus", "-b:a", "32k", "-ac", "1", "-ar", "48000", dst.name],
+                check=True, capture_output=True, timeout=30,
+            )
+            return open(dst.name, "rb").read()
+        except Exception as e:
+            logging.warning(f"mp3->ogg convert failed: {e}")
+            return None
+
+
+async def mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes | None:
+    """Голосовые сообщения Telegram рендерятся как voice-бабл только для ogg/opus, HF Space отдаёт mp3."""
+    return await asyncio.to_thread(_mp3_to_ogg_opus_sync, mp3_bytes)
 
 
 async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, budget: list[int]) -> str:
@@ -2283,7 +2314,7 @@ async def cmd_debug(message: Message):
 
 # ─── Кнопочное меню (без команд) ──────────────────────────────
 MENU_BUTTON_TEXT = "☰ Меню"
-pending_action: dict[int, str] = {}   # user_id -> "export" | "info" | "remind" | "voiceclone" | "cancel"
+pending_action: dict[int, str] = {}   # user_id -> "export" | "info" | "remind" | "cancel"
 
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -2310,10 +2341,6 @@ def menu_inline_keyboard(user_id: int) -> InlineKeyboardMarkup:
             icon_custom_emoji_id=EMOJI_EXPORT_PROGRESS_ID,
         )],
         [InlineKeyboardButton(text="📋 Мои напоминания", callback_data="menu_reminders")],
-        *[
-            [InlineKeyboardButton(text=f"🗣 Сказать голосом «{name}»", callback_data=f"menu_voiceclone:{name}")]
-            for name in named_voice_profiles
-        ],
         [InlineKeyboardButton(text=digest_label, callback_data="menu_toggle_digest")],
     ])
 
@@ -2379,10 +2406,6 @@ async def on_menu_callback(callback: CallbackQuery):
     elif action == "menu_reminders":
         pending_action.pop(uid, None)
         await run_reminders(callback.message, uid)
-    elif action.startswith("menu_voiceclone:"):
-        profile = action.split(":", 1)[1]
-        pending_action[uid] = f"voiceclone:{profile}"
-        await callback.message.answer("🗣 Напиши текст, который озвучить.")
     elif action == "menu_toggle_digest":
         if uid in digest_disabled:
             digest_disabled.discard(uid)
@@ -2424,6 +2447,94 @@ async def on_cancel_reminder_button(callback: CallbackQuery):
     except Exception:
         pass
     await callback.answer("✅ Отменено")
+
+
+@dp.callback_query(F.data == "noop")
+async def on_noop_callback(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.inline_query()
+async def on_inline_query(inline_query: InlineQuery):
+    query = inline_query.query.strip()
+    if not query or not named_voice_profiles:
+        await inline_query.answer([], cache_time=1, is_personal=True)
+        return
+
+    placeholder_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏳ Генерируется…", callback_data="noop")]
+    ])
+    results = [
+        InlineQueryResultArticle(
+            id=f"{profile}:{secrets.token_hex(4)}",
+            title=f"🗣 Озвучить голосом «{profile}»",
+            description=query[:80],
+            input_message_content=InputTextMessageContent(
+                message_text=f"{MIC} Генерирую голосом «{profile}»…",
+                parse_mode="HTML",
+            ),
+            reply_markup=placeholder_kb,
+        )
+        for profile in named_voice_profiles
+    ]
+    await inline_query.answer(results, cache_time=1, is_personal=True)
+
+
+@dp.chosen_inline_result()
+async def on_chosen_inline_result(chosen: ChosenInlineResult):
+    inline_message_id = chosen.inline_message_id
+    if not inline_message_id:
+        return
+
+    profile = chosen.result_id.split(":", 1)[0]
+    text = chosen.query.strip()
+
+    mp3_bytes = await _generate_voice_clone(profile, text)
+    if not mp3_bytes:
+        try:
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=f"{WARNING} Не удалось озвучить — бесплатный сервис клонирования сейчас недоступен.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    ogg_bytes = await mp3_to_ogg_opus(mp3_bytes)
+    if ogg_bytes:
+        try:
+            await bot.send_voice(chosen.from_user.id, BufferedInputFile(ogg_bytes, filename="voice.ogg"))
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=f"{MIC} Голосом «{profile}»: «{html_mod.escape(text[:60])}» — прислал тебе в личку",
+                parse_mode="HTML",
+            )
+            return
+        except Exception as e:
+            logging.warning(f"send_voice to inline user failed: {e}")
+
+    # Фолбэк: не вышло отправить как настоящее голосовое (например, юзер не открывал бота в личке) —
+    # вставляем как обычный аудиофайл прямо в исходное inline-сообщение.
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
+    gen_token = secrets.token_urlsafe(16)
+    voice_gen_store[gen_token] = mp3_bytes
+    audio_url = f"https://{domain}/voice_gen/{gen_token}.mp3"
+    try:
+        await bot.edit_message_media(
+            inline_message_id=inline_message_id,
+            media=InputMediaAudio(media=audio_url, title=f"{profile}: {text[:40]}"),
+        )
+    except Exception as e:
+        logging.warning(f"inline edit_message_media failed: {e}")
+        try:
+            await bot.edit_message_text(
+                inline_message_id=inline_message_id,
+                text=f"{WARNING} Сгенерировал, но не смог вставить: {html_mod.escape(str(e))}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
 
 
 @dp.message((F.chat.type == "private") & (F.voice | F.video_note))
@@ -2468,8 +2579,6 @@ async def on_pending_input(message: Message):
         await run_info(message, arg)
     elif action == "remind":
         await run_remind(message, text)
-    elif action.startswith("voiceclone:"):
-        await run_voice_clone(message, text, profile=action.split(":", 1)[1])
 
 
 @dp.message(Command("start"))
@@ -2519,6 +2628,8 @@ async def main():
     allowed = [
         "message",
         "callback_query",
+        "inline_query",
+        "chosen_inline_result",
         "business_message",
         "edited_business_message",
         "deleted_business_messages",
@@ -2550,6 +2661,7 @@ async def main():
         return web.Response(text="OK")
     app.router.add_get("/", health)
     app.router.add_get("/voice_ref/{token}", serve_voice_ref)
+    app.router.add_get("/voice_gen/{token}", serve_voice_gen)
 
     if domain and port:
         # ─── Railway: webhook ─────────────────────────────
