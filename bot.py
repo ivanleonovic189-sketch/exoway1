@@ -271,31 +271,6 @@ async def _generate_voice_clone(profile: str, text: str) -> bytes | None:
         return None
 
 
-def _mp3_to_ogg_opus_sync(mp3_bytes: bytes) -> bytes | None:
-    import subprocess
-    import tempfile
-    import imageio_ffmpeg
-
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    with tempfile.NamedTemporaryFile(suffix=".mp3") as src, tempfile.NamedTemporaryFile(suffix=".ogg") as dst:
-        src.write(mp3_bytes)
-        src.flush()
-        try:
-            subprocess.run(
-                [ffmpeg, "-y", "-i", src.name, "-c:a", "libopus", "-b:a", "32k", "-ac", "1", "-ar", "48000", dst.name],
-                check=True, capture_output=True, timeout=30,
-            )
-            return open(dst.name, "rb").read()
-        except Exception as e:
-            logging.warning(f"mp3->ogg convert failed: {e}")
-            return None
-
-
-async def mp3_to_ogg_opus(mp3_bytes: bytes) -> bytes | None:
-    """Голосовые сообщения Telegram рендерятся как voice-бабл только для ogg/opus, HF Space отдаёт mp3."""
-    return await asyncio.to_thread(_mp3_to_ogg_opus_sync, mp3_bytes)
-
-
 async def _bubble_html(msg_id: int, data: dict | None, owner_id: int | None, budget: list[int]) -> str:
     if not data:
         return f'<div class="row system"><span>Сообщение #{msg_id} — нет данных в кеше</span></div>'
@@ -2470,7 +2445,7 @@ async def on_inline_query(inline_query: InlineQuery):
             title=f"🗣 Озвучить голосом «{profile}»",
             description=query[:80],
             input_message_content=InputTextMessageContent(
-                message_text=f"{MIC} Генерирую голосом «{profile}»…",
+                message_text=MIC,
                 parse_mode="HTML",
             ),
             reply_markup=placeholder_kb,
@@ -2501,21 +2476,6 @@ async def on_chosen_inline_result(chosen: ChosenInlineResult):
             pass
         return
 
-    ogg_bytes = await mp3_to_ogg_opus(mp3_bytes)
-    if ogg_bytes:
-        try:
-            await bot.send_voice(chosen.from_user.id, BufferedInputFile(ogg_bytes, filename="voice.ogg"))
-            await bot.edit_message_text(
-                inline_message_id=inline_message_id,
-                text=f"{MIC} Голосом «{profile}»: «{html_mod.escape(text[:60])}» — прислал тебе в личку",
-                parse_mode="HTML",
-            )
-            return
-        except Exception as e:
-            logging.warning(f"send_voice to inline user failed: {e}")
-
-    # Фолбэк: не вышло отправить как настоящее голосовое (например, юзер не открывал бота в личке) —
-    # вставляем как обычный аудиофайл прямо в исходное inline-сообщение.
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
     gen_token = secrets.token_urlsafe(16)
     voice_gen_store[gen_token] = mp3_bytes
