@@ -8,6 +8,7 @@ import os
 import random
 import re
 import secrets
+from urllib.parse import quote
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -236,9 +237,9 @@ async def serve_voice_ref(request):
 
 
 async def serve_voice_gen(request):
-    """Отдаёт сгенерированную озвучку по одноразовому токену — Telegram сам её скачивает при inline-редактировании."""
-    raw_token = request.match_info.get("token", "")
-    token = raw_token.rsplit(".", 1)[0]
+    """Отдаёт сгенерированную озвучку по одноразовому токену — Telegram сам её скачивает при inline-редактировании.
+    Токен — в query-параметре, а не в пути, чтобы Telegram показывал красивое имя файла из пути."""
+    token = request.query.get("t", "")
     data = voice_gen_store.pop(token, None)
     if data is None:
         return web.Response(status=404)
@@ -2480,7 +2481,7 @@ async def on_chosen_inline_result(chosen: ChosenInlineResult):
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("RENDER_EXTERNAL_HOSTNAME") or ""
     gen_token = secrets.token_urlsafe(16)
     voice_gen_store[gen_token] = mp3_bytes
-    audio_url = f"https://{domain}/voice_gen/{gen_token}.mp3"
+    audio_url = f"https://{domain}/voice_gen/{quote('🗣')}.mp3?t={gen_token}"
     try:
         await bot.edit_message_media(
             inline_message_id=inline_message_id,
@@ -2622,7 +2623,7 @@ async def main():
         return web.Response(text="OK")
     app.router.add_get("/", health)
     app.router.add_get("/voice_ref/{token}", serve_voice_ref)
-    app.router.add_get("/voice_gen/{token}", serve_voice_gen)
+    app.router.add_get("/voice_gen/{name}", serve_voice_gen)
 
     if domain and port:
         # ─── Railway: webhook ─────────────────────────────
