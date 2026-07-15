@@ -38,6 +38,7 @@ MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
 CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 # ─────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
@@ -200,7 +201,7 @@ def _get_hf_voice_client():
     global _hf_voice_client
     if _hf_voice_client is None:
         from gradio_client import Client
-        _hf_voice_client = Client(HF_VOICE_CLONE_SPACE)
+        _hf_voice_client = Client(HF_VOICE_CLONE_SPACE, token=HF_TOKEN or None)
     return _hf_voice_client
 
 

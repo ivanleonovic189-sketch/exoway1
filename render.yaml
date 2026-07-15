@@ -18,3 +18,5 @@ services:
         sync: false
       - key: CF_API_TOKEN
         sync: false
+      - key: HF_TOKEN
+        sync: false
